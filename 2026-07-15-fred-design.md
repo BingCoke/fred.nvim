@@ -55,6 +55,8 @@ FRED must:
 18. Remain responsive while scanning, copying, and rendering large directory sets.
 19. Keep the public Lua interface small and stable.
 20. Build from source for validated Neovim and `nvim-oxi` combinations.
+21. Render optional metadata columns such as icons, permissions, size, and timestamps without changing editable path syntax.
+22. Bound in-memory scan and metadata cache retention with explicit time, memory, and entry-count cleanup policies.
 
 ## 3. Non-Goals For Version One
 
@@ -66,7 +68,7 @@ Version one will not:
 - support SSH, S3, archives, containers, or other remote backends;
 - expose a public backend registration interface;
 - edit file contents inside the FRED buffer;
-- track file-content versions through hashes, size, or modification time;
+- use file-content hashes, size, or modification time as namespace identity or conflict versions (size and timestamps may still be displayed as metadata columns);
 - infer external rename identity from inodes or platform file keys;
 - provide ACID semantics across a batch of filesystem operations;
 - automatically retry or undo a partially executed batch;
@@ -117,7 +119,7 @@ A non-empty FRED buffer plan may mutate only after:
 
 An entry absent from the current buffer because of ignore rules, filters, sorting, baseline depth, local collapse, scan limits, scan cancellation, scan failure, or missing watcher coverage remains part of filesystem state.
 
-Absence from a projection cannot generate deletion. Only removal of a bound entry identity from an editable projection generates delete intent.
+Absence from a projection cannot generate deletion. Only removal of a bound entry identity from an editable projection generates delete intent. Metadata columns are projection-only: a missing, stale, or failed metadata value cannot create, remove, rename, or delete intent.
 
 ### 5.3 Path Is Not Identity
 
@@ -320,6 +322,77 @@ Rules:
 - type, status, and marks are virtual text and are not part of editable syntax.
 
 FRED does not indent entries or draw connector glyphs. Directories and descendants are related by path prefixes, not visual tree structure.
+
+#### 7.2.1 Metadata Columns
+
+FRED borrows the useful shape of Oil's column registry and column specifications, while keeping its own flat path-list model. The reference implementation is Oil's [`columns.lua`](https://github.com/stevearc/oil.nvim/blob/b73018b75affd13fa38e2fc94ef753b465f770d7/lua/oil/columns.lua) and [`oil-columns` documentation](https://github.com/stevearc/oil.nvim/blob/b73018b75affd13fa38e2fc94ef753b465f770d7/doc/oil.txt#L412-L494). FRED does not copy Oil runtime code or depend on Oil.
+
+The editable buffer line remains exactly one encoded root-relative path. Columns are rendered as Neovim extmark virtual text at byte column zero with `virt_text_pos = "inline"`; they are not inserted into the buffer line, are not parsed by the planner, and cannot be mistaken for a path component. The path is always the final visible field. EntryId remains an extmark and is never rendered as editable text.
+
+The initial built-in columns are:
+
+- `icon`: a stable icon for file, directory, symlink, and other entry kinds; the built-in provider has kind fallbacks and accepts configured icon strings;
+- `permissions`: a platform permission string such as `rwxr-xr-x`; unavailable permissions render `-` and never fail a scan;
+- `size`: the entry's byte size, formatted compactly; directory size is not recursively calculated and renders `-` unless directly available;
+- `mtime`: last modification time;
+- `ctime`: change/status time where the platform exposes it;
+- `atime`: last access time where the platform exposes it;
+- `birthtime`: creation time where the platform exposes it;
+- `type`: the normalized entry kind, useful for display or sorting.
+
+`mtime` is the default timestamp column. `ctime`, `atime`, and `birthtime` are opt-in because their meaning and availability differ across platforms. Version one columns are read-only metadata. In particular, the permissions column does not turn a virtual text edit into `chmod`; a future explicit action may add that behavior without changing buffer path syntax.
+
+Column specifications follow the Oil-like string-or-table shape:
+
+```lua
+columns = {
+  "icon",
+  "permissions",
+  { "size", align = "right" },
+  { "mtime", format = "%Y-%m-%d %H:%M", width = 16 },
+}
+```
+
+With that configuration, the screen may look like this; actual glyphs depend on the configured icon strings:
+
+```text
+  rwxr-xr-x       384  2026-07-16 10:22  .git/
+  rw-r--r--     81.5k  2026-07-16 10:22  2026-07-15-fred-design.md
+```
+
+The actual buffer text remains:
+
+```text
+.git/
+2026-07-15-fred-design.md
+```
+
+FRED displays neither Oil's concealed `/NNN` internal-ID prefix nor a `../` parent row. EntryId stays in an extmark, and the View root is intentionally not represented by a row.
+
+A string selects defaults. A table uses the first element as the column name and may set `width`, `align` (`"left"`, `"center"`, or `"right"`), `format` for time columns, `highlight`, `separator`, and column-specific icon options. The path column is implicit and cannot be removed.
+
+The default separator is one display cell. Default minimum display widths are two cells for `icon`, nine for `permissions`, eight for `size`, nine for `type`, and the formatted display width for each timestamp. Missing values use `-` and the same padding/alignment as present values. `width` is a minimum measured with Neovim display width, not byte length; a wider value expands that column for the whole projection rather than being truncated. All rows in one projection therefore use the same stable boundaries. This follows Oil's projection-wide width/alignment pass in [`view.lua`](https://github.com/stevearc/oil.nvim/blob/b73018b75affd13fa38e2fc94ef753b465f770d7/lua/oil/view.lua#L650-L818), adapted to virtual text rather than editable prefix text.
+
+The internal Rust definition is intentionally small:
+
+```text
+ColumnDefinition {
+  name
+  required_metadata
+  default_width
+  default_alignment
+  render(entry, metadata, column_options) -> highlighted text chunks
+  sort_value(entry, metadata) -> optional scalar
+}
+```
+
+Version one registers only built-in columns; it does not expose a public custom-column or backend registration API. Unlike Oil, FRED column definitions do not parse mutable column text because only the path exists in the buffer syntax.
+
+Each column definition declares the metadata it needs. `icon` and `type` use already-known entry kind; `permissions`, `size`, and time columns request stat metadata. A scan requests the union of metadata fields required by all attached Views of a RootSession, just as coverage is the union of their directory scopes. This follows Oil's on-demand `require_stat` approach in [`files.lua`](https://github.com/stevearc/oil.nvim/blob/b73018b75affd13fa38e2fc94ef753b465f770d7/lua/oil/adapters/files.lua#L50-L225). Metadata failures render a placeholder and a non-blocking status rather than making a namespace scan authoritative or failed. Refreshing metadata may re-render clean and dirty Views, but changes to permissions, size, or timestamps never create FRED namespace conflicts.
+
+Changing columns only reprojects the View and requests any missing metadata. It never changes buffer lines, dirty state, edit-base revisions, or filesystem intent. Sorting may use `path`, `type`, `size`, `mtime`, `ctime`, `atime`, or `birthtime`; unavailable metadata sorts after available values and does not block apply.
+
+A metadata revision may re-sort a clean View. A dirty View updates virtual columns only and freezes its real buffer-line order; metadata-driven re-sorting is recorded as pending until the View becomes clean after apply, discard, successful empty-plan synchronization, or re-root. Changing a sort key while dirty follows the same rule. This prevents metadata refresh from changing buffer text, changedtick, extmark movement, or undo history.
 
 ### 7.3 Commands And Mappings
 
@@ -626,7 +699,9 @@ A published filesystem snapshot is immutable and carries a monotonically increas
 
 Provisional batches and individual scopes may render as they arrive, but a generation publishes exactly one new immutable `current_snapshot` only after every requested scope reaches a terminal complete, partial, or failed result. Partial and failed scopes remain explicitly non-authoritative inside that single published result. Late or cancelled generations cannot publish, and provisional data never updates a View's edit base.
 
-Published snapshots remain alive while referenced by dirty Views and are released when no View needs them.
+Published snapshots remain alive while referenced by dirty Views and are released when no View needs them. Namespace snapshots contain identity, path, kind, coverage authority, and scan status; optional permission, size, and timestamp observations live in a separate RootSession metadata cache with its own monotonically increasing `metadata_revision`. Metadata enrichment or eviction may re-render columns without advancing `root_revision` or any View edit base.
+
+Cleanup may release only cache objects that are not protected by the current RootSession, an attached View's edit base, pending intent or diagnostics, an active scan/apply task, or watcher coverage. This protection rule applies uniformly to scan-cache rows, metadata records, provisional batches, and obsolete snapshots.
 
 ### 10.2 RootSession
 
@@ -638,9 +713,16 @@ RootSession {
   current_snapshot: Arc<Snapshot>
   root_revision
   scan_cache
+  metadata_cache
+  metadata_revision
+  scan_generation
+  metadata_generation
+  cache_usage: { estimated_bytes, cached_entry_count }
+  cleanup_lru
   directory_status
   watcher_state
   coverage_reference_counts
+  metadata_reference_counts
   task_state: Idle | Scan | Apply
 }
 ```
@@ -660,6 +742,9 @@ View {
   local_expansions
   filter
   sort
+  sort_pending
+  columns
+  column_layout
   projection
   intent
   intent_generation
@@ -672,7 +757,7 @@ View {
 
 A clean View may advance its edit base whenever a new snapshot is published. A dirty View keeps the immutable snapshot against which its current intent was captured.
 
-Two Views over the same root may use different depth, expansion, filter, and sort settings and may both contain edits.
+Two Views over the same root may use different depth, expansion, filter, sort, and column settings and may both contain edits.
 
 ### 10.4 Revision And Rebase Behavior
 
@@ -684,7 +769,7 @@ When a new snapshot is published:
 - conflicting paths, kinds, identities, or destinations remain visible and block the affected plan;
 - the dirty View advances its edit base only after a successful rebase.
 
-File contents, size, and modification time are not part of this conflict model.
+File contents, permissions, size, and timestamps are not part of this conflict model.
 
 ### 10.5 View Lifecycle
 
@@ -726,6 +811,7 @@ required directory scopes
 baseline depth
 local expansion overrides
 ignore matcher
+required metadata fields from configured columns and sort keys
 max_entries
 max_directories
 generation
@@ -735,6 +821,7 @@ The worker emits bounded events such as:
 
 ```text
 ScanBatch
+MetadataBatch
 ScanProgress
 DirectoryComplete
 DirectoryFailed
@@ -745,14 +832,21 @@ ScanCancelled
 Requirements:
 
 - emit at most `render_batch_size` entries per batch;
-- attach a generation to every event;
-- discard events from obsolete generations;
+- attach `scan_generation` to namespace events and `metadata_generation` plus `source_root_revision` to metadata events;
+- increment `metadata_generation` whenever required metadata fields change, a metadata request is cancelled, or a new namespace snapshot publishes;
+- accept a MetadataBatch only when its metadata generation is current, its source root revision still equals `root_revision`, every field remains required, and EntryId plus encoded path still match the current snapshot;
+- discard events from obsolete scan or metadata generations;
+- attach metadata observations to EntryId plus the observed encoded path so a late value cannot bind to a moved or replaced entry;
 - record each requested scope as complete, partial, or failed for that generation;
 - never follow a directory symlink;
 - stop at configured limits and report partial coverage;
 - publish exactly one immutable snapshot only after every requested scope in the generation has reached a terminal result;
 - retain partial and failed scopes as non-authoritative status inside the published generation result;
-- keep Neovim calls on the main thread.
+- keep Neovim calls on the main thread;
+- fetch stat metadata only when a configured column or sort key requires it;
+- allow metadata-only enrichment to use the bounded Scan worker/channel without publishing a namespace snapshot or advancing `root_revision`;
+- publish accepted metadata batches by advancing only `metadata_revision` and re-rendering affected virtual columns;
+- treat metadata collection failure as a per-entry placeholder, not as a namespace scan failure.
 
 Default limits:
 
@@ -779,6 +873,8 @@ Temporary filters do not reduce coverage because they alter projection only.
 
 Coverage is reference-counted. When no attached View needs a directory, its watcher may be released and its cached state may cease to be authoritative. COPY_TREE and DELETE_TREE do not add descendant enumeration coverage.
 
+Metadata requirements are also reference-counted as the union of attached View columns and sort keys. Removing a column may release its metadata requirement without reducing directory coverage. Optional metadata that no View requires becomes eligible for cleanup, while namespace entry identity, path, kind, and coverage authority remain intact.
+
 ### 12.3 Watcher Behavior
 
 FRED automatically attempts to establish watchers for covered directories; version one has no watcher toggle. Established watchers monitor covered directories. Events are debounced and coalesced by affected directory, then trigger incremental scan requests.
@@ -786,6 +882,36 @@ FRED automatically attempts to establish watchers for covered directories; versi
 FRED-generated mutations also produce watcher events. The executor reports affected paths so watcher events can be merged with explicit post-execution refresh.
 
 If watcher coverage cannot be established, FRED displays a degraded warning and leaves manual refresh available. Missing watcher coverage alone does not prevent apply.
+
+### 12.4 Cache Cleanup Policy
+
+FRED has no persistent disk cache in version one. Cache cleanup governs Rust-owned scan entries, per-entry metadata, provisional scan batches, and obsolete snapshots retained by references. It never deletes or changes filesystem entries. Oil's hidden-buffer cleanup in [`view.lua`](https://github.com/stevearc/oil.nvim/blob/b73018b75affd13fa38e2fc94ef753b465f770d7/lua/oil/view.lua#L227-L241) is a useful lifecycle reference, but FRED cannot clear all state at once because RootSessions, watcher coverage, and dirty edit-base snapshots are shared.
+
+`cached_entry_count` counts namespace rows retained by `scan_cache`; attached metadata records do not add another count, and provisional batches plus snapshots are not part of this count. `estimated_bytes` includes scan-cache rows, metadata records, provisional batches, and uniquely owned retained snapshots.
+
+Cleanup has two layers:
+
+1. Reference cleanup is mandatory. Cancelled or obsolete scan generations release provisional batches immediately. When a View is wiped out, re-rooted, or closed, its coverage references and edit-base reference are released. A directory cache entry with no coverage reference, watcher, active task, pinned diagnostic, pending intent, or snapshot reference may be dropped immediately.
+2. Policy cleanup is opportunistic. A bounded sweeper follows the object-class priority defined below and removes least-recently-used eligible objects within each class when they exceed the configured idle age, memory estimate, or entry count. Old snapshots are eligible only when no attached View or RootSession state references them.
+
+The public policy is:
+
+```lua
+cleanup = {
+  interval_ms = 30000,
+  max_idle_ms = 300000,
+  max_memory_bytes = 268435456,
+  max_cached_entries = 0,
+}
+```
+
+`interval_ms` controls only the periodic sweeper. `max_idle_ms` evicts eligible cache objects according to each object's monotonic `last_used_at`. `max_memory_bytes` is a soft budget for the estimated Rust-owned scan-cache, metadata, and retained snapshot bytes. `max_cached_entries` is a soft count limit for `scan_cache` namespace rows. Each value must be an integer greater than or equal to zero; `0` disables that individual optional condition.
+
+Reference cleanup always runs. Policy cleanup is event-driven after cache insertion, View detach, scan completion/cancellation, and watcher coverage changes whenever any of `max_idle_ms`, `max_memory_bytes`, or `max_cached_entries` is nonzero. A nonzero `interval_ms` adds timer ticks so idle entries can expire without another event. `interval_ms = 0` disables only those timer ticks; it does not disable event-driven enforcement of the other nonzero thresholds. If all three thresholds are `0`, a timer tick has no policy candidates and only mandatory reference cleanup remains.
+
+Memory accounting is an estimate of FRED-owned cache data, not process RSS. A memory or count limit may remain above target when all remaining objects are protected by a View, edit base, active task, watcher, diagnostic, or pending intent. FRED never evicts protected state merely to satisfy a soft limit. Evicted data is fetched again when coverage or a requested column needs it.
+
+Expiry first releases obsolete provisional batches and unreferenced snapshots, then unrequired metadata by oldest `last_used_at`, then uncovered scan-cache rows and their attached metadata by oldest `last_used_at`. Entry-count pressure uses only the final scan-cache-row step. Memory pressure continues through the same ordered classes until at or below budget or no eligible object remains. Work is bounded so cleanup does not block Neovim or starve scan event draining. Cleanup errors are reported as warnings, do not mutate the filesystem, and never block apply.
 
 ## 13. Ignore, Filter, Sort, And Depth
 
@@ -801,7 +927,7 @@ Baseline depth semantics:
 
 Local expansion depth is relative to the selected directory. `zo` expands one level; `zO` requests recursive materialization subject to scan limits.
 
-Changing ignore rules requests a new browse scan. Changing filter or sort only reprojects. Changing baseline depth or local expansion updates coverage. None of these changes generates filesystem intent.
+Changing ignore rules requests a new browse scan. Changing a filter only reprojects. Changing sort reprojects a clean View and requests missing metadata when its key requires stat data; a dirty View records the sort as pending without reordering real buffer lines. Changing baseline depth or local expansion updates coverage. None of these changes generates filesystem intent.
 
 Default ordering is stable lexical ordering by normalized relative path. Destination collision checks use actual platform/filesystem behavior, while displayed spelling remains unchanged.
 
@@ -886,7 +1012,7 @@ Planner validation rejects:
 - directory COPY_TREE or MOVE to itself or its descendant;
 - dependency cycles that cannot be resolved with a unique same-directory rename name.
 
-The planner does not reject ordinary file-content, size, or modification-time changes.
+The planner does not reject ordinary file-content, permission, size, or timestamp changes.
 
 A destination occupied by another planned identity is allowed only when that identity is moved away or explicitly removed earlier in the same plan. Final execution still uses exclusive/no-replace operations.
 
@@ -1049,7 +1175,7 @@ Rules:
 - source kind changed: conflict;
 - desired destination appeared or became occupied: conflict;
 - both disk and user changed the same namespace identity incompatibly: conflict;
-- ordinary file content, size, or modification time changed: not a FRED conflict;
+- ordinary file content, permissions, size, or timestamps changed: not a FRED conflict;
 - external rename: represent conservatively as old-path deletion plus new-path creation.
 
 Watcher events trigger incremental refresh automatically. `:FredRefresh` forces reconciliation of the View's required browse coverage.
@@ -1103,8 +1229,11 @@ src/
   view.rs
   task.rs
   scanner.rs
+  metadata.rs
   watcher.rs
   coverage.rs
+  columns.rs
+  cleanup.rs
   model.rs
   identity.rs
   provenance.rs
@@ -1129,8 +1258,11 @@ The modules expose small internal interfaces with substantial behavior behind th
 
 - `path` owns canonical buffer/native path conversion and validation;
 - `snapshot` owns immutable revisioned namespace state;
-- `root_session` owns shared scan, watcher, and coverage state;
-- `view` owns per-buffer projection, edit base, and intent;
+- `root_session` owns shared scan, watcher, coverage, and cache-accounting state;
+- `metadata` owns platform metadata collection and normalized optional values;
+- `columns` owns built-in column definitions, formatting, alignment, and sort values;
+- `cleanup` owns candidate selection, LRU ordering, soft limits, and bounded sweeps;
+- `view` owns per-buffer projection, column layout, edit base, and intent;
 - `planner` maps immutable namespace inputs to a logical DAG;
 - `tree_ops` exposes single deep COPY_TREE and DELETE_TREE operations while hiding platform traversal;
 - `executor` is the sole planned-mutation caller;
@@ -1151,9 +1283,21 @@ require("fred").setup({
   ignore = {
     ".git/",
   },
+  columns = {
+    "icon",
+    -- "permissions",
+    -- "size",
+    -- { "mtime", format = "%Y-%m-%d %H:%M", width = 16 },
+  },
   sort = {
     by = "path",
     case_sensitive = false,
+  },
+  cleanup = {
+    interval_ms = 30000,
+    max_idle_ms = 300000,
+    max_memory_bytes = 268435456,
+    max_cached_entries = 0,
   },
   limits = {
     max_entries = 50000,
@@ -1177,13 +1321,17 @@ require("fred").setup({
 
 Baseline `depth = 0` keeps initial scanning and watcher coverage shallow. Users may raise it globally or materialize selected directories locally.
 
+`columns` defaults to `{"icon"}`. The path is implicit and always remains the editable buffer field. Column metadata is virtual text, so changing `columns` is safe even when a View is dirty; FRED requests any newly required metadata and reprojects without changing intent.
+
 Watcher establishment is automatic in version one and is not configurable. Establishment failure produces a degraded warning without blocking apply.
 
 Confirmation is not configurable in version one: every non-empty plan previews and confirms once.
 
 Symlink traversal is not configurable in version one: directory symlinks are always leaves.
 
-Configuration is validated during setup. Invalid values produce explicit errors rather than silent fallback.
+`cleanup.interval_ms`, `cleanup.max_idle_ms`, `cleanup.max_memory_bytes`, and `cleanup.max_cached_entries` are non-negative integers. A value of `0` disables only the corresponding optional cleanup condition, while reference cleanup on View/session lifecycle remains mandatory. `interval_ms = 0` disables only timer ticks; nonzero idle, memory, or entry thresholds are still enforced at event-driven cleanup points.
+
+Configuration is validated during setup. Invalid column names, duplicate columns, unsupported column options, invalid alignments, invalid time formats, negative cleanup values, or non-integer cleanup values produce explicit errors rather than silent fallback.
 
 ## 22. Error Handling
 
@@ -1194,6 +1342,8 @@ Errors fall into four classes.
 The buffer remains readable. Failed or limited browse scopes are marked partial or degraded. Manual refresh and scope reduction remain available.
 
 Scan or watcher failure does not globally disable apply. A plan is blocked only when its own required source, destination, or parent state cannot be checked.
+
+Cache cleanup is best effort. An individual metadata read or cache release failure is reported without invalidating the namespace snapshot, disabling apply, or deleting filesystem data.
 
 ### 22.2 Validation Or Final-Preflight Error
 
@@ -1239,7 +1389,15 @@ A refresh error is reported through Neovim without blocking a later apply or cre
 - file content, size, and mtime changes not producing conflicts;
 - external rename represented as delete plus create;
 - immutable edit-base retention and candidate snapshot publication;
-- RootSession coverage reference counting.
+- RootSession coverage reference counting;
+- column registry validation, virtual-text rendering, fixed-width alignment, metadata placeholders, and metadata-only refresh;
+- column and sort metadata requirements fetching only the required stat fields;
+- cleanup candidate protection for current snapshots, dirty edit bases, active tasks, watcher coverage, diagnostics, and pending intent;
+- cleanup age, memory, and entry-count thresholds, including independent `0` disables and `interval_ms = 0` with nonzero event-driven thresholds;
+- `max_cached_entries` counting only scan-cache namespace rows while metadata, provisional batches, and snapshots contribute only to the memory estimate;
+- object-class eviction priority with least-recently-used ordering inside each class;
+- metadata-generation cancellation and MetadataBatch rejection for stale-generation/current-source-revision and current-generation/stale-source-revision cases after column, sort, path, and namespace-revision changes;
+- clean metadata sorting versus dirty-View pending sort without buffer-line, changedtick, or undo changes.
 
 ### 23.2 Integration Tests
 
@@ -1274,7 +1432,15 @@ A refresh error is reported through Neovim without blocking a later apply or cre
 - partial failure retaining completed effects and abandoning failed/unstarted initiating intent;
 - cross-filesystem file and directory MOVE;
 - cross-filesystem copy success followed by source deletion failure;
-- process restart performing an ordinary scan of partial results.
+- process restart performing an ordinary scan of partial results;
+- column changes while Views are clean and dirty without changing editable lines or intent;
+- metadata refresh after size, permission, or timestamp changes;
+- cleanup after View close, re-root, scan cancellation, and watcher coverage release;
+- memory and count pressure following object-class priority and least-recently-used ordering within each class;
+- entry-count pressure ignoring metadata records, provisional batches, and snapshots;
+- exact virtual-column fixture without `/NNN` or `../`, with raw buffer lines containing only paths;
+- stale metadata events after cancellation, column changes, entry moves, and snapshot publication, including independent stale-generation/current-source-revision and current-generation/stale-source-revision fixtures;
+- `interval_ms = 0` preserving event-driven memory/count enforcement.
 
 ### 23.3 Headless Neovim Tests
 
@@ -1311,7 +1477,11 @@ A refresh error is reported through Neovim without blocking a later apply or cre
 - collapse preserving pinned entries;
 - partial scan warnings without global apply disablement;
 - large-batch rendering responsiveness;
-- worker notification through `AsyncHandle` queue draining.
+- worker notification through `AsyncHandle` queue draining;
+- virtual columns not changing buffer text, changedtick, undo history, or path parsing;
+- configuring every built-in column and rejecting invalid column/cleanup setup values;
+- clean metadata sort reordering and dirty metadata sort deferral without changedtick or undo mutation;
+- aligned placeholders and display-cell widths for narrow and wide icon glyphs.
 
 ### 23.4 Property Tests
 
@@ -1331,7 +1501,10 @@ Randomly generated snapshots and intents must preserve:
 - every post-lock outcome leaves Apply and releases the global mutation lock;
 - completed execution-node results deterministically produce the same in-memory namespace model;
 - shared coverage equals the union of attached View requirements;
-- dirty View rebase always retains its immutable edit base until rebase completes.
+- dirty View rebase always retains its immutable edit base until rebase completes;
+- metadata columns, sorting, and cleanup never change filesystem intent;
+- cleanup never evicts a snapshot or cache entry still reachable from a protected View/session state;
+- setting any cleanup threshold to `0` disables that threshold without disabling mandatory reference cleanup.
 
 ## 24. Performance Requirements
 
@@ -1345,6 +1518,9 @@ Randomly generated snapshots and intents must preserve:
 - Multiple Views share snapshot and watcher data rather than rescanning one canonical root independently.
 - Memory use scales linearly with covered entries, retained edit-base snapshots, and visited directories.
 - Snapshot versions are released when no dirty View references them.
+- Stat metadata is fetched only for columns and sort keys that require it; metadata-only refresh must not trigger unnecessary namespace planning.
+- Metadata sorting may reorder only clean Views; dirty Views defer real-line sorting while virtual columns continue to refresh.
+- Cleanup is bounded and runs outside the Neovim rendering critical path; memory/count pressure follows the documented object-class priority and uses least-recently-used ordering within each class.
 - Version one uses no Tokio runtime and no speculative thread pool.
 
 ## 25. Implementation Sequence
@@ -1352,7 +1528,7 @@ Randomly generated snapshots and intents must preserve:
 1. Establish the Cargo workspace, exact Neovim patch-version and pinned `nvim-oxi` build pairs, Linux/Windows build paths, Lua `build`/load facade, setup validation, command and mapping registration, and headless Neovim test harness.
 2. Implement canonical path algebra, reversible filename encoding, immutable Snapshot, RootSession/View state, runtime registry, and read-only flat rendering.
 3. Implement the Rust worker channel, bounded provisional batches, cancellation, generation checks, `AsyncHandle` notification, and one atomic snapshot publication after every requested scope in a generation is terminal.
-4. Add baseline depth, local expansion/collapse, coverage reference counting, ignore rules, filtering, sorting, partial-state UI, unconditional watcher establishment attempts, and degraded watcher reporting.
+4. Add baseline depth, local expansion/collapse, coverage reference counting, ignore rules, filtering, sorting, metadata columns, conditional stat fetching, partial-state UI, unconditional watcher establishment attempts, degraded watcher reporting, and the bounded cache cleanup policy.
 5. Add immutable dirty-View edit bases, namespace-only three-way rebase, overlapping RootSession invalidation, and conflict diagnostics.
 6. Add EntryId extmarks, Neovim 0.11 `p`/`P` wrappers, Neovim 0.12 put-event support, `:FredNew file`, `:FredNew dir`, ordinary edit capture, provenance normalization, `gp`, and directory-row descendant hiding.
 7. Implement immutable direct namespace probes, the pure planner with both revision tokens, COPY_TREE/DELETE_TREE logical operations, nested directory normalization, descendant evacuation, self-subtree rejection, replacement validation, collision checks, and cross-filesystem MOVE expansion.
@@ -1375,32 +1551,35 @@ Version one is ready when:
 6. Dirty Views retain immutable edit-base snapshots across external namespace changes.
 7. Ignore, filter, sort, depth, expansion, collapse, scan cancellation, scan failure, scan limits, and watcher gaps never imply deletion.
 8. Watcher establishment is automatic; establishment failure produces a degraded warning without globally blocking unrelated valid apply operations.
-9. External namespace changes refresh clean Views and rebase dirty Views within covered scope.
-10. Same-named files in different directories retain distinct EntryIds.
-11. Ordinary edits and `:FredNew file`/`:FredNew dir` create, move, rename, replace, and delete files and directories from final desired state.
-12. Listed Neovim 0.11 pairs use buffer-local `p`/`P`, and listed 0.12 pairs use supported put events, without guessing unobserved insertion origins.
-13. Source retained produces COPY; one destination with removed source produces MOVE; multiple destinations with removed source produce copies followed by source deletion.
-14. `gp` copies selected top-level entries into a directory and generates deterministic `_N` names.
-15. DELETE_TREE and COPY_TREE each appear as one logical operation without advance descendant enumeration.
-16. Removing a directory row hides unedited descendants and evacuates explicitly moved descendants before DELETE_TREE.
-17. Directory COPY_TREE and MOVE to self or a descendant are rejected.
-18. Directory MOVE emits one parent move plus only explicitly required descendant operations in conditional dependency order.
-19. Immutable planner probes and repeated final-preflight probes reject missing sources, wrong source kinds, occupied destinations, missing or non-directory parents, and parent traversal through symlinks.
-20. Destination collision never overwrites, including a destination that appears after final preflight.
-21. Invalid or conflicted planning results open non-confirmable diagnostics and preserve dirty edits; only valid non-empty plans open one all-or-nothing confirmation preview; an empty valid plan clears modified state without preview.
-22. Every plan carries distinct edit-base and planned-root revisions, and stale revision, changedtick, or intent-generation checks abort before mutation.
-23. Every post-lock outcome leaves Apply, processes queued refresh demand, and releases the process-global mutation lock.
-24. The global lock prevents concurrent apply or `:FredLink` across same, unrelated, and overlapping roots.
-25. Cross-filesystem file and directory MOVE executes as copy to the final destination followed by source deletion only after copy success.
-26. The executor stops on the first execution error and runs no later operation.
-27. Completed-node results update the in-memory namespace model deterministically; partial execution reports completed, failed, and unstarted operations, abandons failed/unstarted initiating-View intent, and re-renders from that model.
-28. Filesystem refresh remains best effort; refresh failure reports through Neovim without adding a special state or blocking a later apply.
-29. Successful and partially failed mutation invalidates and refreshes overlapping RootSessions on a best-effort basis.
-30. File content, size, and mtime changes do not create FRED namespace conflicts.
-31. External rename is handled conservatively without inode/file-key identity inference.
-32. `:FredLink {from} {to}` executes immediately with buffer-directory relative resolution and exclusive destination creation; every success or failure releases the global lock, namespace-changing outcomes invalidate and refresh overlapping RootSessions on a best-effort basis before release, and a later apply or `:FredLink` can proceed.
-33. All Rust unit, integration, property, and headless Neovim tests pass.
-34. FRED runs without Oil installed and contains no Oil runtime dependency.
+9. Configured metadata columns render as aligned virtual text without changing editable path lines; FRED displays no `/NNN` ID prefix or `../` row, and built-in icon, permission, size, and timestamp columns handle unavailable metadata with placeholders.
+10. Column requirements are fetched as the union of attached View requirements; a MetadataBatch with either a stale metadata generation or a mismatched source root revision is rejected independently, metadata-only changes never create namespace conflicts or deletion intent, and metadata sorting cannot reorder a dirty View's real lines.
+11. Unreferenced cache state is released on lifecycle events; optional idle-time, memory, and entry-count cleanup thresholds evict only eligible state, every threshold set to `0` is disabled independently, and `interval_ms = 0` leaves other nonzero thresholds event-driven.
+12. External namespace changes refresh clean Views and rebase dirty Views within covered scope.
+13. Same-named files in different directories retain distinct EntryIds.
+14. Ordinary edits and `:FredNew file`/`:FredNew dir` create, move, rename, replace, and delete files and directories from final desired state.
+15. Listed Neovim 0.11 pairs use buffer-local `p`/`P`, and listed 0.12 pairs use supported put events, without guessing unobserved insertion origins.
+16. Source retained produces COPY; one destination with removed source produces MOVE; multiple destinations with removed source produce copies followed by source deletion.
+17. `gp` copies selected top-level entries into a directory and generates deterministic `_N` names.
+18. DELETE_TREE and COPY_TREE each appear as one logical operation without advance descendant enumeration.
+19. Removing a directory row hides unedited descendants and evacuates explicitly moved descendants before DELETE_TREE.
+20. Directory COPY_TREE and MOVE to self or a descendant are rejected.
+21. Directory MOVE emits one parent move plus only explicitly required descendant operations in conditional dependency order.
+22. Immutable planner probes and repeated final-preflight probes reject missing sources, wrong source kinds, occupied destinations, missing or non-directory parents, and parent traversal through symlinks.
+23. Destination collision never overwrites, including a destination that appears after final preflight.
+24. Invalid or conflicted planning results open non-confirmable diagnostics and preserve dirty edits; only valid non-empty plans open one all-or-nothing confirmation preview; an empty valid plan clears modified state without preview.
+25. Every plan carries distinct edit-base and planned-root revisions, and stale revision, changedtick, or intent-generation checks abort before mutation.
+26. Every post-lock outcome leaves Apply, processes queued refresh demand, and releases the process-global mutation lock.
+27. The global lock prevents concurrent apply or `:FredLink` across same, unrelated, and overlapping roots.
+28. Cross-filesystem file and directory MOVE executes as copy to the final destination followed by source deletion only after copy success.
+29. The executor stops on the first execution error and runs no later operation.
+30. Completed-node results update the in-memory namespace model deterministically; partial execution reports completed, failed, and unstarted operations, abandons failed/unstarted initiating-View intent, and re-renders from that model.
+31. Filesystem refresh remains best effort; refresh failure reports through Neovim without adding a special state or blocking a later apply.
+32. Successful and partially failed mutation invalidates and refreshes overlapping RootSessions on a best-effort basis.
+33. File content, permissions, size, and timestamp changes do not create FRED namespace conflicts.
+34. External rename is handled conservatively without inode/file-key identity inference.
+35. `:FredLink {from} {to}` executes immediately with buffer-directory relative resolution and exclusive destination creation; every success or failure releases the global lock, namespace-changing outcomes invalidate and refresh overlapping RootSessions on a best-effort basis before release, and a later apply or `:FredLink` can proceed.
+36. All Rust unit, integration, property, and headless Neovim tests pass.
+37. FRED runs without Oil installed and contains no Oil runtime dependency.
 
 ## 27. Residual Risks
 
@@ -1415,7 +1594,9 @@ Version one is ready when:
 - Other compiling platforms may expose unhandled platform-specific behavior until concrete reports arrive.
 - OS watcher behavior and limits differ; degraded watcher coverage must remain visible.
 - Very large repositories may require users to narrow baseline depth, local expansion, or ignore rules.
-- Retained immutable snapshots increase memory use while dirty Views remain open.
+- Retained immutable snapshots increase memory use while dirty Views remain open; soft memory limits cannot evict state that remains referenced.
+- Metadata columns add stat calls and platform-specific formatting cost, especially for large covered roots.
+- A failed or unavailable stat may leave a placeholder until the next metadata refresh; it must never be interpreted as a missing namespace entry.
 - Extmark and provenance behavior under complex edits requires headless and property testing.
 - `nvim-oxi` couples the native build to the exact patch-version/revision pairs listed in build configuration; every new pair requires explicit validation and may require a rebuild.
 
