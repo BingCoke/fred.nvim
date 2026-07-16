@@ -2,6 +2,7 @@
 
 **Status:** Accepted direction; implementation pending
 **Date:** 2026-07-15
+**Last revised:** 2026-07-17
 **Project:** `fred.nvim`
 **Expansion:** Filesystem Representation Editor
 
@@ -11,7 +12,7 @@ FRED is a buffer-native file browser for Neovim. It projects selected parts of a
 
 FRED is independent. It does not depend on, integrate with, or call Oil. It may borrow general ideas such as editable directory buffers, entry identity, asynchronous rendering, operation planning, and confirmation before mutation, but it owns its scanner, snapshots, views, planner, executor, watcher integration, and user interface.
 
-FRED uses a required Rust `cdylib` built locally by the user or plugin manager. The runtime is Rust-first and uses `nvim-oxi` for filesystem state, scanning, planning, and execution. Lua owns the stable Instance facade, resolved configuration, actions, keymaps, attach callbacks, registry lookup, and layout orchestration. Initial layouts use `nui.nvim` behind an adapter so the core lifecycle does not depend on NUI types. FRED does not publish precompiled binaries.
+FRED uses a required Rust `cdylib` built locally by the user or plugin manager. The runtime is Rust-first and uses `nvim-oxi` for filesystem state, scanning, planning, and execution. Lua owns the stable Instance facade, resolved configuration, actions, keymaps, attach callbacks, registry lookup, native Neovim layouts, and lifecycle autocmds. FRED supports only explicitly validated Neovim 0.12 patch-version and pinned `nvim-oxi` revision pairs. It does not publish precompiled binaries or provide a pure-Lua fallback.
 
 The view is a flat list of complete root-relative paths. It is not an indented tree, sidebar, or connector-glyph hierarchy. A view may materialize different directories to different depths while every displayed line remains a complete path.
 
@@ -46,7 +47,7 @@ FRED must:
 9. Prevent hidden, ignored, unscanned, collapsed, or depth-excluded entries from being interpreted as deletions.
 10. Share immutable filesystem snapshots and watcher coverage between multiple views of the same canonical root while preserving per-view intent and projection state.
 11. Detect external namespace changes and update attached views automatically within materialized coverage.
-12. Reject invalid paths, missing sources, wrong source kinds, missing parents, and occupied destinations before mutation when they are directly required by a plan.
+12. Reject invalid paths, missing sources, wrong source kinds, required parents that neither exist nor are created by the same plan, and occupied destinations before mutation.
 13. Never silently overwrite an existing destination.
 14. Preview every non-empty operation plan and require one all-or-nothing confirmation.
 15. Permit only one FRED mutation anywhere in the Neovim process at a time.
@@ -78,7 +79,7 @@ Version one will not:
 - provide a persistent transaction journal, rollback command, or crash recovery;
 - provide a filesystem-level undo command;
 - publish precompiled native binaries;
-- support Neovim 0.10 or earlier;
+- support Neovim 0.11 or earlier, nightly builds, or unlisted Neovim 0.12 patch releases;
 - guarantee preservation of every platform-specific metadata feature during copy;
 - guarantee atomic cross-filesystem moves;
 - provide Dired-style persistent marks, arbitrary shell commands, recursive grep, archive management, or image galleries;
@@ -131,9 +132,9 @@ Every scanned entry receives an opaque `EntryId` scoped to its shared RootSessio
 
 ### 5.4 Direct Namespace Checks Authorize Operations
 
-A partial or degraded browse snapshot does not globally disable apply. Before planning, the runtime captures immutable direct namespace-probe results for every source, destination, and parent required by the current intent. The pure planner consumes those probe results without performing I/O. Final preflight repeats the same probes under the process-global mutation lock.
+A partial or degraded browse snapshot does not globally disable apply. Before planning, the runtime captures immutable direct namespace-probe results for every source, destination, existing required parent, and planned-parent chain required by the current intent. For a parent created by the same plan, probes establish that the planned path is either absent or occupied by a base identity that the plan explicitly removes or moves away before creating the directory; an occupied path must still match the base identity's expected path and kind under FRED's ordinary path/kind checks. Probes also establish that the chain's nearest existing ancestor is a directory reached without traversing a symlink. The pure planner consumes those probe results without performing I/O. Final preflight repeats the same probes under the process-global mutation lock.
 
-An operation is blocked when its required namespace state cannot be established, including a missing source, wrong source kind, missing or non-directory parent, parent traversal through a symlink, invalid path, or occupied destination.
+An operation is blocked when its required namespace state cannot be established, including a missing source, wrong source kind, required parent that neither exists nor is created by the plan, non-directory parent or nearest existing ancestor, parent traversal through a symlink, invalid path, or occupied destination. A parent that the same valid plan creates is not rejected merely because it is currently absent.
 
 Directory COPY_TREE and DELETE_TREE do not require advance enumeration of every descendant.
 
@@ -183,12 +184,12 @@ One instance owns one buffer and View. Multiple windows may display that buffer,
 
 ### 6.1 Supported Neovim And Platform Combinations
 
-FRED supports only the exact compatibility pairs listed in the build configuration. Each pair contains:
+FRED supports only exact Neovim 0.12 compatibility pairs listed in the build configuration. Each pair contains:
 
-- one exact Neovim patch version;
-- one pinned `nvim-oxi` revision.
+- one exact Neovim 0.12 patch version;
+- one pinned `nvim-oxi` revision using its `neovim-0-12` feature.
 
-The build helper accepts only a listed pair and rejects every unlisted patch/revision combination rather than guessing a feature selection. Other Neovim patch versions, including nightly, are unsupported until they are explicitly validated and added to the list. Neovim 0.10 and earlier remain unsupported.
+The build helper accepts only a listed pair and rejects every unlisted patch/revision combination rather than guessing a feature selection. Neovim 0.11 and earlier, nightly builds, and unlisted 0.12 patches are unsupported. The first candidate is Neovim 0.12.4, but it becomes a supported pair only after the FRED compatibility harness validates every direct Neovim call used by the internal `nvim_adapter`, including buffer access, range extmarks, inline virtual text, changedtick access, and main-thread notification.
 
 FRED actively supports and tests:
 
@@ -212,7 +213,7 @@ FRED publishes source code, not native binaries. A plugin manager may build it w
 
 The helper detects the exact running Neovim patch version, selects its listed pinned `nvim-oxi` revision, invokes `cargo build --release`, and installs or locates the resulting platform-native library. Artifacts for incompatible listed pairs must not overwrite one another.
 
-Upgrading Neovim or the pinned `nvim-oxi` revision may require rebuilding FRED.
+Upgrading Neovim or the pinned `nvim-oxi` revision may require rebuilding FRED. The Lua facade may load far enough to expose `build()` and an actionable diagnostic, but `fred.new()` fails when the required compatible native library is missing or cannot load. There is no degraded pure-Lua browse mode or precompiled-binary fallback.
 
 ### 6.3 Rust-First Runtime
 
@@ -220,7 +221,7 @@ Rust owns:
 
 - canonical paths, immutable snapshots, RootSession, View, identity, provenance, and intent state;
 - scanning, metadata collection, watching, coverage, planning, execution, refresh, and shared cleanup accounting;
-- extmark-backed entry identity, virtual column decorations, buffer parsing, direct namespace probes, and the process-global mutation gate;
+- extmark-backed entry identity, virtual column decorations, buffer parsing, direct namespace probes, and the process-global mutation gate through one internal `nvim_adapter` for every direct Neovim call;
 - worker tasks, generation checks, and main-thread notification.
 
 Lua owns:
@@ -229,9 +230,9 @@ Lua owns:
 - `setup()` configuration capture and `new()`/child-instance inheritance;
 - the public Instance object and live-instance registry lookups;
 - action functions, mode-grouped buffer-local keymaps, FileType metadata, and `on_attach`;
-- NUI-backed layout adapters, window ownership, open/hide/toggle/focus behavior, and Neovim lifecycle autocmds.
+- native Neovim layout construction, window ownership, open/hide/toggle/focus behavior, highlight definitions, and Neovim lifecycle autocmds.
 
-The boundary passes opaque InstanceId/ViewId handles, validated values, buffer/window identifiers, and explicit operation results. Lua does not reimplement filesystem planning, and Rust does not depend on NUI objects or user callback tables.
+The boundary passes opaque InstanceId/ViewId handles, validated values, buffer/window identifiers, and explicit operation results. Lua does not reimplement filesystem planning, and Rust does not depend on user callback tables. Rust modules outside `nvim_adapter` do not call `nvim_oxi::api` directly; this keeps the exact-patch compatibility surface explicit and testable.
 
 ### 6.4 Background Work And Task State
 
@@ -266,7 +267,7 @@ AtomicBool cancellation
 nvim_oxi::libuv::AsyncHandle
 ```
 
-Worker threads never call Neovim functions directly. They enqueue bounded events and use `AsyncHandle::send()` only to wake the main loop. Because wakeups may coalesce, the main-thread callback drains all currently available events from the queue.
+Worker threads never call Neovim functions directly. They enqueue bounded events and use `AsyncHandle::send()` only to wake the main loop. Because wakeups may coalesce, each main-thread callback drains only one entry-count-limited or time-limited batch. If events remain, it calls `AsyncHandle::send()` again before returning. A producer that continues filling the bounded channel therefore cannot turn one callback into an unbounded main-thread drain.
 
 Parallelism may be added later only where benchmarks demonstrate a real bottleneck.
 
@@ -402,7 +403,7 @@ buffer delete or wipeout      -> Destroyed
 destroy()                     -> Destroyed
 ```
 
-Fred tracks `BufWinEnter`, `WinEnter`, `WinClosed`, `BufHidden`, `BufDelete`, and `BufWipeout` so direct Neovim window or buffer operations cannot leave stale instance registrations. Any window that displays the instance buffer cancels the instance cleanup timer. The timer starts only when no window displays the buffer.
+Fred uses `WinNew`, `BufWinEnter`, `WinEnter`, `WinClosed`, and `BufHidden` as display-reconciliation triggers; event-local counters are not authoritative. Reconciliation derives displays from valid windows that actually contain the instance buffer. Because `WinClosed` fires before the closing window disappears from window queries, its reconciliation is deferred to the next main-loop turn. Any reconciled window displaying the buffer cancels the cleanup timer, and the timer starts only after reconciliation finds no display. A validated `BufDelete` or `BufWipeout` for the instance's current buffer bypasses display reconciliation and invokes the terminal destroy path directly.
 
 Instance cleanup is configured per instance:
 
@@ -444,12 +445,13 @@ local explorer = fred.new({
 })
 
 explorer:open()
-explorer:open({ layout = "vsplit" })
+explorer:open() -- focuses an existing display in the current tabpage
+explorer:open({ layout = "vsplit", new_display = true })
 ```
 
-`new({ layout = ... })` sets the instance default. `open({ layout = ... })` overrides only that open call and does not mutate resolved configuration. `open()` may create multiple windows for the same instance, including multiple windows in one tabpage.
+`new({ layout = ... })` sets the instance default. If the current tabpage already displays the instance buffer, `open()` focuses one such window and does not create another display; a per-call `layout` is ignored in that case. If the current tabpage has no display, `open({ layout = ... })` creates one there even when another tabpage displays the same buffer. `open({ new_display = true, layout = ... })` explicitly creates an additional display. Per-call options do not mutate resolved configuration.
 
-Version one uses `nui.nvim` for initial window construction, but NUI is isolated behind an internal layout adapter. Instance, View, RootSession, actions, and the Rust filesystem core do not expose or depend on NUI types. The adapter returns ordinary buffer/window identifiers plus hide, restore, and focus operations. Detailed visual styling is not part of the core lifecycle contract.
+Version one constructs every layout directly with native Neovim Lua APIs. The internal `layout` module returns ordinary buffer/window ownership records plus hide, restore, and focus operations. It does not expose a speculative adapter interface or depend on NUI. Detailed visual styling is not part of the core lifecycle contract.
 
 Initial layouts are:
 
@@ -821,13 +823,23 @@ lib/
 
 Full-buffer `:write`, `:update`, and `:wq` invoke the same apply behavior as `instance:apply()` and `:FredApply`.
 
+The Lua `BufWriteCmd` handler starts the confirmation/apply pipeline and does not return to the write command until that attempt reaches a terminal result. It may pump the Neovim event loop while Rust workers run, but the pipeline does not mutate buffer lines while the callback is active. One post-apply View synchronizer owns reprojection, edit-capture suppression, `'modified'`, and the new undo baseline.
+
+Write outcomes are explicit:
+
+- successful apply or a successful empty plan records a pending clean projection, clears `'modified'`, and returns write success;
+- cancellation or any pre-execution failure records no projection, leaves `'modified'` set, and returns without write success;
+- execution failure records a pending clean projection from the model containing only completed effects, clears `'modified'` because failed/unstarted intent is abandoned, and reports write failure so `:wq` remains open.
+
+After `BufWriteCmd` returns, the synchronizer applies any pending projection with edit capture suppressed, establishes the ordinary undo baseline, and restores the outcome's intended `'modified'` value. A direct `instance:apply()` or `:FredApply` invocation uses the same synchronizer immediately when no command-event restriction is active.
+
 Rules:
 
 - every non-empty plan is previewed and confirmed;
 - `:wq` closes only after successful apply or a successful empty plan;
 - preview cancellation, validation failure, stale-plan failure, lock contention, or final-preflight failure leaves `'modified'` set;
-- successful apply clears `'modified'` and establishes a new ordinary undo baseline;
-- an empty plan reprojects and sorts the View, clears `'modified'`, and returns without preview;
+- successful apply produces a clean synchronized View and a new ordinary undo baseline through the post-apply synchronizer;
+- an empty plan records a synchronized model, produces a clean reprojected and sorted View through the same synchronizer, and returns without preview;
 - alternate-file writes, ranged writes, and append writes are rejected;
 - hiding an instance or transferring its window does not apply, discard, or prompt; the hidden buffer remains editable state until reopened or destroyed;
 - destroying an instance discards unapplied buffer text and intent without filesystem mutation;
@@ -892,16 +904,16 @@ DELETE_TREE does not require the directory to be expanded or fully scanned. Prev
 
 ### 8.4 Copy Provenance From Normal Editing
 
-Extmarks track positions through supported buffer edits but do not travel through yank or put. FRED therefore records provenance separately.
+Extmarks track positions through supported buffer edits but do not travel through yank or put. FRED therefore records provenance separately on every supported Neovim 0.12 pair.
 
-On Neovim 0.11:
+- FRED installs buffer-local `p` and `P` wrappers because Neovim 0.12 does not expose `TextPutPre` or `TextPutPost`;
+- the wrappers execute normal put behavior, preserving the chosen register, count, direction, undo behavior, and cursor semantics, then record the inserted range;
+- `TextYankPost` stores provenance for the affected register as its register name, text and register type snapshot, `RootSessionId`, and source EntryIds;
+- a wrapper attaches provenance only when the register actually used still has the recorded text and type and belongs to the same RootSession; a mismatch invalidates that register's provenance;
+- provenance is valid only in the same RootSession; wrappers do not attach foreign-session provenance;
+- insertions not observed with valid same-session provenance are ordinary unbound CREATE declarations, even if their text matches an existing row.
 
-- FRED installs buffer-local `p` and `P` wrappers;
-- the wrappers preserve normal put behavior while recording the register, source EntryIds, and inserted range;
-- `TextYankPost` records FRED-aware yank and delete provenance;
-- insertions not observed through the wrappers are ordinary unbound CREATE declarations, even if their text matches an existing row.
-
-On Neovim 0.12, FRED may additionally use `TextPutPre` and `TextPutPost` to cover native put paths exposed by Neovim.
+FRED does not guess provenance from matching text or from another RootSession.
 
 Typical behavior:
 
@@ -931,7 +943,7 @@ All copies precede source deletion. The same rule applies to directory sources u
 
 ### 8.6 Paste Into Directory
 
-`:FredPasteInto`, mapped to `gp`, copies the most recent FRED-aware yank into the directory under the cursor.
+`:FredPasteInto`, mapped to `gp`, copies the most recent FRED-aware yank into the directory under the cursor. The yank must belong to the current View's RootSession; a parent- or child-instance yank from a different RootSession produces an explicit error. Users can expand directories in the same flat View when source and destination must share provenance.
 
 Example:
 
@@ -1167,17 +1179,19 @@ After any successful or partially successful mutation, the runtime invalidates s
 
 ## 11. Identity And Provenance
 
-Every rendered existing row has an extmark carrying its opaque RootSession-scoped `EntryId`. Marks and statuses bind to EntryId, not line number.
+Every rendered existing row has a full-line range extmark carrying its opaque RootSession-scoped `EntryId`. The range spans `[row, 0]` through `[row + 1, 0]` with `right_gravity = false`, `end_right_gravity = true`, `invalidate = true`, and `undo_restore = true`. Deleting the complete row during user edit capture invalidates the mark instead of moving a point mark onto an adjacent row. Renderer-owned reprojection, sorting, and post-apply synchronization run under an internal-sync guard that suppresses edit capture and discards/recreates identity marks; their invalidations never create delete intent. Marks and statuses bind to EntryId, not line number.
 
 Identity rules:
 
-- editing text preserves identity while the extmark remains associated with that row;
-- moving text preserves identity only when Neovim actually moves the extmark with it;
+- editing text preserves identity while one valid range extmark remains associated with that row;
+- moving text preserves identity only when Neovim moves that exact range with it;
+- an invalid range mark observed outside the internal-sync guard represents user removal of its bound row;
+- one rendered existing row cannot carry multiple valid existing EntryIds, and two rows cannot carry the same identity;
 - yank and put never copy an extmark;
-- a provenance-linked put receives a new pending identity with `copy_from = EntryId`;
-- source removal plus one destination may normalize that destination to MOVE;
-- two existing rows cannot carry the same identity;
-- if an extmark is lost, FRED may rebind only through a unique, unconsumed, unchanged base path;
+- a provenance-linked put receives a new pending identity with `copy_from = { root_session_id, entry_id }`;
+- provenance from another RootSession is never resolved or normalized as COPY/MOVE in the current View;
+- source removal plus one same-session destination may normalize that destination to MOVE;
+- if an extmark is lost for a reason other than range invalidation, FRED may rebind only through a unique, unconsumed, unchanged base path;
 - ambiguous lost identity is never guessed;
 - external rename is represented conservatively as deletion of the old path and creation of the new path.
 
@@ -1346,7 +1360,7 @@ View edit-base snapshot and edit_base_revision
 current published snapshot and planned_root_revision
 captured View intent
 current changedtick and intent generation
-immutable direct namespace-probe results for required sources, destinations, and parents
+immutable direct namespace-probe results for required sources, destinations, existing parents, and planned-parent chains
 path and platform rules
 execution policy
 ```
@@ -1411,7 +1425,9 @@ Planner validation rejects:
 - destinations that collide under the destination filesystem's behavior;
 - destination occupied by an identity not explicitly removed;
 - source that disappeared or changed kind;
-- missing or non-directory parent;
+- required parent that neither exists nor is created by the same plan;
+- a planned-parent path occupied by an identity that the same plan does not first remove or move away;
+- non-directory existing parent or nearest existing ancestor of a planned-parent chain;
 - parent traversal through a symlink;
 - directory COPY_TREE or MOVE to itself or its descendant;
 - dependency cycles that cannot be resolved with a unique same-directory rename name.
@@ -1441,14 +1457,15 @@ The normalization chooses operations that reach the final namespace without trea
 
 The operation DAG enforces:
 
-1. parent directory creation before child creation;
-2. all copies from a source before deleting that source;
-3. descendant evacuation before parent directory MOVE or DELETE_TREE when the descendant ends outside the parent's final subtree;
-4. parent MOVE before descendant edits that remain inside the parent's final subtree;
-5. unique temporary rename steps before completing a swap, cycle, or case-only rename;
-6. destination copy success before source deletion for cross-filesystem MOVE;
-7. explicit target removal before installing REPLACE when required by the desired state;
-8. irreversible deletes as late as dependencies permit.
+1. an existing planned-parent occupant is removed or moved away before the replacement parent directory is created;
+2. every planned parent-directory creation precedes CREATE, COPY, COPY_TREE, MOVE, or REPLACE installing a descendant destination;
+3. all copies from a source precede deletion of that source;
+4. descendant evacuation precedes parent directory MOVE or DELETE_TREE when the descendant ends outside the parent's final subtree;
+5. parent MOVE precedes descendant edits that remain inside the parent's final subtree;
+6. unique temporary rename steps precede completion of a swap, cycle, or case-only rename;
+7. destination copy success precedes source deletion for cross-filesystem MOVE;
+8. explicit target removal precedes REPLACE installation when required by the desired state;
+9. irreversible deletes run as late as dependencies permit.
 
 All execution nodes run serially. Version one does not execute independent nodes concurrently.
 
@@ -1472,7 +1489,7 @@ Each row shows the source, destination, and kind. Tree operations are displayed 
 
 Confirmation is all-or-nothing. The user cannot deselect individual operations because doing so could invalidate dependencies or produce a namespace different from the edited buffer. To omit an operation, the user cancels, edits the buffer, and applies again.
 
-Every valid non-empty plan uses this single confirmation. An empty valid plan reprojects, sorts, clears `'modified'`, and returns without opening preview.
+Every valid non-empty plan uses this single confirmation. An empty valid plan records a clean synchronized projection and returns without opening preview; the post-apply synchronizer applies the reprojection, sorting, `'modified'`, and undo-baseline effects at the invocation-appropriate time.
 
 ## 17. Executor And Failure Semantics
 
@@ -1485,7 +1502,7 @@ After the user confirms a valid plan:
 3. compare the plan's changedtick and intent generation with the initiating View;
 4. compare `edit_base_revision` with the initiating View's current edit-base revision;
 5. compare `planned_root_revision` with the RootSession's current published revision;
-6. repeat every required source, destination, and parent namespace probe under the lock;
+6. repeat every required source, destination, existing-parent, planned-parent-state, and nearest-existing-ancestor probe under the lock;
 7. execute the plan serially only if all checks still match;
 8. apply completed execution-node results deterministically to the in-memory namespace model and publish the resulting immutable model revision;
 9. invalidate overlapping RootSessions and queue best-effort filesystem refresh;
@@ -1525,13 +1542,13 @@ It then:
 - applies every completed node effect deterministically to the in-memory namespace model;
 - publishes a new immutable model revision;
 - clears the initiating View's intent;
-- re-renders the initiating View from that model;
-- clears `'modified'`;
-- establishes a new ordinary undo baseline;
+- records a clean initiating-View projection from that model for the post-apply synchronizer;
 - invalidates every RootSession overlapping an affected path;
 - queues best-effort filesystem refresh;
 - reports success;
 - exits through the common post-lock finalization path.
+
+The post-apply synchronizer re-renders the initiating View with edit capture suppressed, clears `'modified'`, and establishes the new ordinary undo baseline. It runs after `BufWriteCmd` returns or immediately for a direct apply invocation.
 
 A refresh error is reported through Neovim and may be corrected by a later watcher event or `:FredRefresh`. It does not create a special degraded, unknown, reconciliation-required, or apply-blocking state.
 
@@ -1544,12 +1561,12 @@ On the first execution error, FRED:
 3. records completed, failed, and unstarted nodes;
 4. applies only completed-node effects deterministically to the in-memory namespace model and publishes the resulting immutable model revision;
 5. abandons the initiating View's failed and unstarted intent from that apply attempt;
-6. re-renders the initiating View from the updated in-memory model, clears `'modified'`, and establishes a new ordinary undo baseline;
+6. records a clean initiating-View projection from the updated model for the post-apply synchronizer;
 7. invalidates overlapping RootSessions and queues best-effort filesystem refresh;
 8. shows the execution report;
 9. exits through the common post-lock finalization path.
 
-A failed node is not assumed successful; a later refresh may reveal partial side effects left by that failed system call. The user edits the re-rendered model and starts a new apply if desired. FRED does not offer an automatic retry action.
+A failed node is not assumed successful; a later refresh may reveal partial side effects left by that failed system call. The post-apply synchronizer re-renders the updated model with edit capture suppressed, clears `'modified'`, and establishes a new ordinary undo baseline. A `BufWriteCmd` invocation still reports write failure so `:wq` remains open. The user edits the synchronized model and starts a new apply if desired. FRED does not offer an automatic retry action.
 
 Other dirty Views retain their own intent and rebase against the next published snapshot.
 
@@ -1625,6 +1642,7 @@ Cargo.toml
 build.rs
 src/
   lib.rs
+  nvim_adapter.rs
   config.rs
   runtime.rs
   apply_gate.rs
@@ -1661,8 +1679,7 @@ lua/
   fred/keymaps.lua
   fred/lifecycle.lua
   fred/buffer.lua
-  fred/layout/init.lua
-  fred/layout/nui.lua
+  fred/layout.lua
 plugin/
   fred.lua
 ftplugin/
@@ -1671,6 +1688,7 @@ ftplugin/
 
 The modules expose small internal interfaces with substantial behavior behind them:
 
+- Rust `nvim_adapter` is the only Rust module that calls `nvim_oxi::api` directly and owns the exact-patch-tested buffer, extmark, virtual-text, changedtick, and main-thread notification bindings;
 - Rust `path` owns canonical buffer/native path conversion and validation;
 - Rust `snapshot` owns immutable revisioned namespace state;
 - Rust `root_session` owns shared scan, watcher, coverage, and cache-accounting state;
@@ -1684,8 +1702,8 @@ The modules expose small internal interfaces with substantial behavior behind th
 - Lua `instance` owns the public object, root/config identity, and native handle calls;
 - Lua `registry` owns InstanceId/name/buffer lookup and terminal removal;
 - Lua `actions` and `keymaps` own function-valued actions, context construction, mode/lhs merge, and buffer-local installation;
-- Lua `lifecycle` and `buffer` own Neovim autocmd synchronization, `vim.b.fred`, FileType ordering, attach callbacks, and instance timers;
-- Lua `layout/nui` is the only module coupled to NUI and translates layouts into ordinary window ownership handles.
+- Lua `lifecycle` and `buffer` own Neovim autocmd-triggered reconciliation, `vim.b.fred`, FileType ordering, attach callbacks, and instance timers;
+- Lua `layout` constructs native buffer, float, split, vsplit, and tab displays and returns ordinary window ownership records.
 
 Rust module interfaces remain internal. `src/lib.rs` exposes the native module through `nvim-oxi`; `lua/fred/init.lua` exposes the stable Instance facade. No speculative backend or public custom-column seam is exposed in version one.
 
@@ -1769,7 +1787,7 @@ Direct `fred.new(opts)` deep-merges setup defaults with explicit instance option
 
 `cleanup.shared` is setup-only. Supplying it to direct or child `new()` options is invalid; instances override only `cleanup.instance`.
 
-`root` belongs to `new()` options, defaults to the current working directory, and is not an `open()` option. `layout` belongs to resolved instance options and may be overridden per `open()`/`toggle()` call. Values are `buffer`, `float`, `split`, `vsplit`, or `tab` in version one.
+`root` belongs to `new()` options, defaults to the current working directory, and is not an `open()` option. `layout` belongs to resolved instance options and may be overridden per `open()`/`toggle()` call. Values are `buffer`, `float`, `split`, `vsplit`, or `tab` in version one. `open({ new_display = true })` is a per-call display option, defaults to `false`, and is never stored in resolved configuration.
 
 `keymaps` is keyed by Neovim mode and lhs. Values are functions or `false`; strings are invalid. Functions replace inherited mappings and `false` removes them. `actions.select()` receives entry-kind action functions and returns the final mapping callback.
 
@@ -1827,10 +1845,10 @@ A layout-open failure rolls back only resources created by that open attempt. If
 - decode-then-reencode equality;
 - malformed escapes, `%41` aliases, encoded separators, literal and encoded `.`/`..`, absolute paths, and root escape rejection;
 - Linux byte-path and Windows native-name conversion used by supported builds;
-- EntryId allocation and extmark-loss rebinding rules;
-- provenance normalization for retained source, one removed-source destination, and multiple removed-source destinations;
+- EntryId allocation, full-line range-extmark invalidation, exact start/end gravity, undo restoration, internal-sync suppression, duplicate-row rejection, and lost-mark rebinding rules;
+- register-content-qualified same-RootSession provenance, register overwrite invalidation, and normalization for retained source, one removed-source destination, and multiple removed-source destinations;
 - ignore, hidden-file display, sort, depth, expansion, collapse, scan cancellation, scan failure, scan limits, and watcher gaps never generating deletion;
-- immutable direct namespace-probe inputs for missing sources, wrong kinds, occupied destinations, missing or non-directory parents, and symlink parent traversal;
+- immutable direct namespace-probe inputs for missing sources, wrong kinds, occupied destinations, existing parents, planned-parent absence or planned occupant removal, nearest existing ancestors, and symlink parent traversal;
 - plans carrying distinct `edit_base_revision` and `planned_root_revision` tokens;
 - common post-lock finalization after preflight failure, success, and execution failure;
 - directory-row deletion hiding unedited descendants;
@@ -1880,7 +1898,7 @@ A layout-open failure rolls back only resources created by that open attempt. If
 - immutable pre-plan namespace probes repeated under the global lock;
 - destination appearing between planning and execution without overwrite;
 - source missing or changing kind between planning and execution;
-- missing destination parent, non-directory parent, and parent traversal through a symlink;
+- missing destination parents that are not planned, absent and replacement-created parent chains ordered before child installation, non-directory parents or nearest existing ancestors, and parent traversal through a symlink;
 - independent edit-base and planned-root revision mismatch rejection;
 - rename swaps and case-only rename internal names;
 - common post-lock finalization after final-preflight failure, success, and execution failure;
@@ -1905,8 +1923,8 @@ A layout-open failure rolls back only resources created by that open attempt. If
 
 ### 23.3 Headless Neovim Tests
 
-- build and load with every exact Neovim patch-version and pinned `nvim-oxi` revision pair listed in build configuration;
-- Linux and Windows build/load coverage for every listed pair;
+- build and load with every exact allowlisted Neovim 0.12 patch-version and pinned `nvim-oxi` revision pair;
+- Linux and Windows build/load coverage plus a direct-API compatibility spike for every `nvim_adapter` call in each listed pair;
 - `require("fred").build()` availability;
 - setup, direct-instance, and child-instance configuration validation and inheritance;
 - command registration plus function-valued mode-grouped keymaps with `false` removal and no action strings;
@@ -1920,7 +1938,7 @@ A layout-open failure rolls back only resources created by that open attempt. If
 - unconditional watcher establishment attempts, degraded establishment failure, and manual refresh;
 - watcher-driven clean refresh and dirty namespace rebase;
 - overlapping RootSession invalidation after mutation;
-- `buftype=acwrite` full `:write`, `:update`, and `:wq` behavior;
+- `buftype=acwrite` full `:write`, `:update`, and `:wq` behavior, including a `BufWriteCmd` outcome table, deferred capture-suppressed projection, and execution failure that leaves `:wq` open after synchronizing a clean model;
 - rejection of alternate-file, ranged, and append writes;
 - valid non-empty plans requiring one confirmation;
 - invalid/conflicted planning results opening non-confirmable diagnostics and preserving edits;
@@ -1931,28 +1949,27 @@ A layout-open failure rolls back only resources created by that open attempt. If
 - undo baseline reset after successful apply and execution-failure model re-render;
 - cursor and identity preservation after refresh;
 - ignore, hidden-file display, sort, depth, collapse, cancellation, scan failure, limits, and watcher gaps never implying deletion;
-- Neovim 0.11 buffer-local `p`/`P` provenance for listed 0.11 pairs;
-- Neovim 0.12 put-event integration for listed 0.12 pairs;
-- unobserved matching insertions remaining CREATE;
+- Neovim 0.12 buffer-local `p`/`P` wrappers preserving native put behavior while validating register name, text, type, and same-RootSession provenance;
+- register overwrite invalidation, cross-RootSession `gp` rejection, and foreign or unobserved matching insertions remaining CREATE;
 - `gp` into a directory and deterministic `_N` destinations;
 - collapse preserving pending-intent, conflict, and validation rows while ordinary reveal expansions collapse normally;
 - partial scan warnings without global apply disablement;
 - large-batch rendering responsiveness;
-- worker notification through `AsyncHandle` queue draining;
+- worker notification through entry-count- or time-bounded `AsyncHandle` queue batches that re-wake while events remain;
 - virtual columns not changing buffer text, changedtick, undo history, or path parsing;
 - configuring every built-in column and rejecting invalid column/cleanup setup values;
 - clean metadata sort reordering and dirty metadata sort deferral without changedtick or undo mutation;
 - aligned placeholders and display-cell widths for narrow and wide icon glyphs.
 - `fred.new()` setup merge, `instance:new()` parent-option inheritance, immutable resolved config, and no duplicate setup attach callbacks;
 - optional live-name uniqueness and InstanceId/name/buffer registry lookup validation;
-- root resolution during `new()`, per-open layout override, and root absence from `open()` options;
+- root resolution during `new()`, per-open layout selection when creating a display, ignored layout overrides when default `open()` focuses, and root absence from `open()` options;
 - one instance buffer displayed in multiple windows and multiple tabpages;
-- NUI layout adapter isolation from Instance/View/RootSession core types;
+- native Lua layout construction without NUI or layout types leaking into Instance/View/RootSession core types;
 - borrowed-buffer restore, owned float/split/tab hide, and final ordinary-window preservation;
-- unrestricted `open()` creating multiple displays, `hide()` targeting current/explicit window, and no public close/hide-all;
+- `open()` focusing an existing current-tab display by default, `new_display = true` creating an additional display, `hide()` targeting current/explicit windows, and no public close/hide-all;
 - `toggle()` hiding every current-tab display including floats while leaving other tabs untouched, or opening when none exist;
 - default directory action creating a child instance and transferring the triggering window without custom history;
-- Created/Open/Hidden/Destroyed transitions from `BufWinEnter`, `WinClosed`, `BufHidden`, `BufDelete`, and `BufWipeout`;
+- Created/Open/Hidden transitions derived by reconciliation triggered by `WinNew`, `BufWinEnter`, `WinEnter`, deferred `WinClosed`, and `BufHidden`, with validated `BufDelete`/`BufWipeout` entering terminal Destroyed directly;
 - instance `delay_ms` cancellation on redisplay, `0` disablement, and terminal destruction after zero-window delay;
 - hidden dirty buffers remaining available for later apply before expiry, then discarding text/intent without filesystem mutation on destruction;
 - fixed `filetype=fred`, complete `vim.b[bufnr].fred` before FileType autocmds, and live instance lookup by buffer;
@@ -1972,11 +1989,13 @@ Randomly generated snapshots and intents must preserve:
 - no missing DAG dependencies;
 - topological sortability after rename-cycle resolution;
 - no directory COPY_TREE or MOVE into itself;
-- all provenance copies before removed-source deletion;
+- all register-qualified same-RootSession provenance copies before removed-source deletion;
+- register overwrite or cross-RootSession provenance never generating COPY or MOVE;
+- user line deletion invalidating exactly one full-line EntryId range while internal synchronization generates no filesystem intent;
 - no operation after the first injected execution error;
 - ignore, hidden-file display, sort, depth, expansion, collapse, scan cancellation, scan failure, limits, watcher gaps, reveal, layout, and instance lifecycle do not change filesystem intent;
 - no silent overwrite under injected destination races;
-- missing or non-directory parents and symlink parent traversal always reject the affected plan;
+- a required parent must exist or be created earlier by the same plan, including replacement-created parents whose occupant first vacates, while unrelated occupants, non-directory parents or nearest existing ancestors, and symlink parent traversal reject the affected plan;
 - a scan generation publishes at most one immutable current snapshot and only after all requested scopes are terminal;
 - every post-lock outcome leaves Apply and releases the global mutation lock;
 - completed execution-node results deterministically produce the same in-memory namespace model;
@@ -2007,21 +2026,35 @@ Randomly generated snapshots and intents must preserve:
 - Cleanup is bounded and runs outside the Neovim rendering critical path; memory/count pressure follows the documented object-class priority and uses least-recently-used ordering within each class.
 - Instance window bookkeeping is proportional to actual displays and does not duplicate scan/snapshot data.
 - Instance cleanup uses one timer only while undisplayed; redisplay cancels it without polling keyboard activity.
-- NUI layout work remains outside scan event draining and the Rust filesystem critical path.
+- native Lua layout work remains outside scan event draining and the Rust filesystem critical path.
 - Version one uses no Tokio runtime and no speculative thread pool.
 
 ## 25. Implementation Sequence
 
-1. Establish the Cargo workspace, exact Neovim/`nvim-oxi` build pairs, Linux/Windows build paths, local build helper, native loader, NUI dependency, and headless Neovim harness.
-2. Implement Lua configuration capture, direct/child Instance inheritance, immutable resolved options, registry/name lookup, function-valued actions/keymaps, `vim.b.fred`, FileType ordering, attach callbacks, and NUI layout adapter handles.
-3. Implement InstanceId/ViewId native registration, one-buffer-per-instance lifecycle, Neovim window/buffer autocmd synchronization, open/hide/toggle/window transfer, instance timers, and terminal destroy/discard semantics.
+All Section 26 acceptance criteria define the version-one contract. Development proceeds through runnable internal milestones so validation does not wait for the complete mutation stack:
+
+```text
+M0  exact-pair build/load, native loader, Instance lifecycle, and empty View
+M1  read-only scanning, flat projection, expansion, hidden controls, sort, and metadata
+M2  shared RootSession data, watchers, dirty-View edit bases, and namespace rebase
+M3  range EntryIds, edit capture, same-session provenance, pure planner, and preview
+M4  synchronous write integration, global mutation gate, executor, and failure reporting
+M5  cross-filesystem and rename-cycle hardening plus the complete Linux/Windows matrix
+1.0 every Section 26 acceptance criterion passes
+```
+
+The implementation sequence within those milestones is:
+
+1. Establish the Cargo workspace, initial Neovim 0.12.4/`nvim-oxi` candidate, `nvim_adapter` compatibility spike, Linux/Windows build paths, local build helper, native loader, and headless Neovim harness.
+2. Implement Lua configuration capture, direct/child Instance inheritance, immutable resolved options, registry/name lookup, function-valued actions/keymaps, `vim.b.fred`, FileType ordering, attach callbacks, and native layout ownership records.
+3. Implement InstanceId/ViewId native registration, one-buffer-per-instance lifecycle, authoritative window reconciliation, open/hide/toggle/window transfer, instance timers, and terminal destroy/discard semantics.
 4. Implement canonical path algebra, reversible filename encoding, immutable Snapshot, RootSession/View state, runtime registry, and read-only flat rendering.
-5. Implement the Rust worker channel, bounded provisional batches, cancellation, generation checks, `AsyncHandle` notification, and one atomic snapshot publication after every requested scope in a generation is terminal.
+5. Implement the Rust worker channel, bounded provisional and main-thread event batches, cancellation, generation checks, `AsyncHandle` notification with re-wake, and one atomic snapshot publication after every requested scope in a generation is terminal.
 6. Add baseline depth, local expansion/collapse, reference-counted coverage, ignore rules, hidden-file controls, sorting, metadata columns, conditional stat fetching, reveal/navigation, watcher establishment/degraded reporting, and shared cleanup.
 7. Add immutable dirty-View edit bases, namespace-only three-way rebase, overlapping RootSession invalidation, and conflict diagnostics.
-8. Add EntryId extmarks, Neovim 0.11 `p`/`P` wrappers, Neovim 0.12 put-event support, `:FredNew`, edit capture, provenance normalization, `gp`, and directory-row descendant hiding.
-9. Implement immutable direct namespace probes, the pure planner with both revision tokens, COPY_TREE/DELETE_TREE, nested directory normalization, descendant evacuation, self-subtree rejection, replacement validation, collision checks, and cross-filesystem MOVE expansion.
-10. Build `acwrite` integration, write-form rejection, non-confirmable diagnostics, confirmation for valid plans, stale-plan checks, and repeated direct probes in final preflight.
+8. Add full-line range EntryId extmarks, Neovim 0.12 buffer-local `p`/`P` wrappers, `:FredNew`, edit capture, same-RootSession provenance normalization and `gp`, and directory-row descendant hiding.
+9. Implement immutable direct namespace probes including planned-parent chains, the pure planner with both revision tokens, COPY_TREE/DELETE_TREE, nested directory normalization, descendant evacuation, self-subtree rejection, replacement validation, collision checks, and cross-filesystem MOVE expansion.
+10. Build synchronous `acwrite`/`BufWriteCmd` integration, write-form rejection, non-confirmable diagnostics, confirmation for valid plans, stale-plan checks, and repeated direct probes in final preflight.
 11. Implement the process-global mutation lock, common post-lock finalization, deterministic model updates, serial fail-stop execution, deep platform tree operations, no-replace destinations, rename-cycle names, overlap refresh, and partial-failure reporting.
 12. Add immediate `:FredLink`, buffer-directory path resolution, and global-lock integration.
 13. Run complete instance-lifecycle, configuration, layout, FileType, action, reveal/navigation, mutation, failure-injection, multi-view, overlap, Linux/Windows, watcher, and large-tree suites before declaring version one stable.
@@ -2032,7 +2065,7 @@ Each phase must preserve read-only usability before mutation support is enabled.
 
 Version one is ready when:
 
-1. FRED builds locally as a Rust `cdylib` and loads on Linux and Windows for every exact Neovim patch-version and pinned `nvim-oxi` revision pair listed in build configuration.
+1. FRED builds locally as a required Rust `cdylib` and loads on Linux and Windows for every exact allowlisted Neovim 0.12 patch-version and pinned `nvim-oxi` revision pair; every direct `nvim_adapter` call passes the pair's compatibility harness, and missing native libraries produce actionable hard errors without a fallback runtime.
 2. The Lua facade exposes `build`, `setup`, `new`, Instance methods, registry lookups, and function-valued `actions`; setup validates configuration and commands remain convenience wrappers.
 3. `:Fred` creates an unnamed instance and opens a responsive flat `filetype=fred`, `buftype=acwrite` View of a local root.
 4. Multiple Views of one canonical root share immutable snapshots while retaining independent projection and intent.
@@ -2046,14 +2079,14 @@ Version one is ready when:
 12. External namespace changes refresh clean Views and rebase dirty Views within covered scope.
 13. Same-named files in different directories retain distinct EntryIds.
 14. Ordinary edits and `:FredNew file`/`:FredNew dir` create, move, rename, replace, and delete files and directories from final desired state.
-15. Listed Neovim 0.11 pairs use buffer-local `p`/`P`, and listed 0.12 pairs use supported put events, without guessing unobserved insertion origins.
+15. Every listed Neovim 0.12 pair uses buffer-local `p`/`P` wrappers that preserve normal put behavior and record only qualified same-RootSession provenance; cross-session `gp` errors and foreign or unobserved insertions remain CREATE.
 16. Source retained produces COPY; one destination with removed source produces MOVE; multiple destinations with removed source produce copies followed by source deletion.
 17. `gp` copies selected top-level entries into a directory and generates deterministic `_N` names.
 18. DELETE_TREE and COPY_TREE each appear as one logical operation without advance descendant enumeration.
 19. Removing a directory row hides unedited descendants and evacuates explicitly moved descendants before DELETE_TREE.
 20. Directory COPY_TREE and MOVE to self or a descendant are rejected.
 21. Directory MOVE emits one parent move plus only explicitly required descendant operations in conditional dependency order.
-22. Immutable planner probes and repeated final-preflight probes reject missing sources, wrong source kinds, occupied destinations, missing or non-directory parents, and parent traversal through symlinks.
+22. Immutable planner probes and repeated final-preflight probes reject missing sources, wrong source kinds, occupied destinations, required parents neither existing nor created by the plan, unrelated planned-parent occupants, non-directory existing parents or nearest ancestors, and parent traversal through symlinks; a planned occupant vacates before replacement parent creation, which precedes every descendant installation.
 23. Destination collision never overwrites, including a destination that appears after final preflight.
 24. Invalid or conflicted planning results open non-confirmable diagnostics and preserve dirty edits; only valid non-empty plans open one all-or-nothing confirmation preview; an empty valid plan clears modified state without preview.
 25. Every plan carries distinct edit-base and planned-root revisions, and stale revision, changedtick, or intent-generation checks abort before mutation.
@@ -2071,12 +2104,12 @@ Version one is ready when:
 37. FRED runs without Oil installed and contains no Oil runtime dependency.
 38. A direct instance resolves setup options plus explicit options; a child instance inherits the parent's resolved options plus child overrides without duplicating setup callbacks.
 39. Each live InstanceId owns at most one buffer/View, optional names are unique, root is resolved during `new()`, and resolved configuration is immutable.
-40. One instance buffer may appear in multiple windows/tabpages, and `open()` may create multiple displays without duplicating View or RootSession state.
-41. `layout` supports buffer, float, split, vsplit, and tab through a NUI adapter that does not leak NUI types into core Instance/View/RootSession interfaces.
+40. One instance buffer may appear in multiple windows/tabpages; `open()` focuses an existing current-tab display by default, while explicit `new_display = true` creates another display without duplicating View or RootSession state.
+41. `layout` supports buffer, float, split, vsplit, and tab through native Neovim Lua APIs without NUI or layout-specific types leaking into core Instance/View/RootSession interfaces.
 42. Borrowed windows restore prior/alternate/scratch buffers, owned displays close when safe, and FRED never deletes the final ordinary window merely to hide itself.
 43. `hide()` targets the current or explicit window, no public `close()`/hide-all exists, and `toggle()` hides all current-tab displays including floats or opens when none exist.
 44. Default directory selection creates a child instance, transfers the triggering window, preserves normal Neovim history behavior, and leaves the parent buffer available until instance cleanup.
-45. Instance lifecycle tracks actual buffer/window events through Created/Open/Hidden/Destroyed, cancels cleanup while any window displays the buffer, and treats `delay_ms = 0` as disabled.
+45. Instance lifecycle derives Created/Open/Hidden display state through authoritative window reconciliation, defers `WinClosed` reconciliation, sends validated `BufDelete`/`BufWipeout` directly to terminal Destroyed, cancels cleanup while any valid window displays the buffer, and treats `delay_ms = 0` as disabled.
 46. A hidden dirty buffer may be reopened and applied; terminal instance destruction discards unapplied text/intent and releases references without executing a filesystem operation.
 47. Keymaps merge by mode/lhs, accept only functions or `false`, and built-in/custom actions share explicit `action(ctx, opts?)` context.
 48. `actions.select()` dispatches entry kinds to action functions; the default opens files normally and directories in inherited child instances.
@@ -2088,7 +2121,7 @@ Version one is ready when:
 
 ## 27. Residual Risks
 
-- Filesystem races can still occur after direct final preflight begins.
+- Filesystem races can still occur after direct final preflight begins. FRED intentionally compares source path and kind rather than inode or platform file ID, so a rare external same-path, same-kind replacement may be treated as the original source.
 - A fail-stop batch may partially complete before a system call fails.
 - FRED intentionally does not undo completed operations after partial failure.
 - Direct COPY_TREE failure may leave a partial final destination.
@@ -2103,8 +2136,7 @@ Version one is ready when:
 - Metadata columns add stat calls and platform-specific formatting cost, especially for large covered roots.
 - A failed or unavailable stat may leave a placeholder until the next metadata refresh; it must never be interpreted as a missing namespace entry.
 - Extmark and provenance behavior under complex edits requires headless and property testing.
-- `nvim-oxi` couples the native build to the exact patch-version/revision pairs listed in build configuration; every new pair requires explicit validation and may require a rebuild.
-- NUI version or behavior changes may affect layout adapters even though core lifecycle state remains isolated.
+- `nvim-oxi` couples the native build to the exact Neovim 0.12 patch-version/revision pairs listed in build configuration; every new pair requires an explicit `nvim_adapter` compatibility run and may require a rebuild.
 - Opening many windows for one instance increases Neovim window/UI cost even though scan and snapshot data remain shared.
 - Hidden dirty instances may be destroyed after `cleanup.instance.delay_ms`; unapplied edits are intentionally lost at that point.
 - Native jumplist/alternate-buffer behavior depends on normal Neovim window buffer switching and is not supplemented by a Fred history stack.
