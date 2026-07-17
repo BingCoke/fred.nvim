@@ -8,11 +8,11 @@
 
 ## 1. Summary
 
-FRED is a buffer-native file browser for Neovim. It projects selected parts of a local filesystem root into an ordinary editable buffer. The user expresses a desired namespace with normal text editing, then writes the buffer to plan, preview, confirm, and execute the corresponding filesystem operations.
+FRED is a buffer-native file browser for Neovim. It projects selected parts of a local filesystem root into an ordinary editable buffer. The user expresses a desired namespace with normal text editing, then ordinarily writes the current visible Open FRED buffer to plan, preview, confirm, and execute that Instance's corresponding filesystem operations. No public apply/save entrypoint exists.
 
 FRED is independent. It does not depend on, integrate with, or call Oil. It may borrow general ideas such as editable directory buffers, entry identity, asynchronous rendering, operation planning, and confirmation before mutation, but it owns its scanner, snapshots, views, planner, executor, watcher integration, and user interface.
 
-FRED uses a required Rust `cdylib` built locally by the user or plugin manager. The filesystem core is Rust-first and uses `nvim-oxi` for snapshots, identity, scanning, intent, planning, execution, and keyed Neovim buffer reconciliation. Lua owns the stable Instance facade, resolved configuration, actions, keymaps, attach callbacks, registry lookup, native Neovim layouts, lifecycle autocmds, and presentation policy: it filters hidden files and sorts the bounded catalog supplied by Rust, then submits only an ordered visible EntryId sequence for Rust to render. FRED supports only explicitly validated Neovim 0.12 patch-version and pinned `nvim-oxi` revision pairs. It does not publish precompiled binaries or provide a pure-Lua fallback.
+FRED uses a required Rust `cdylib` built locally by the user or plugin manager. The filesystem core is Rust-first and uses `nvim-oxi` for snapshots, identity, scanning, intent, planning, execution, and keyed Neovim buffer reconciliation. Lua owns the stable Instance facade, resolved configuration, actions, keymaps, attach callbacks, registry lookup, native Neovim layouts, lifecycle autocmds, Instance cleanup timers and hidden-group LRUs, and presentation policy: it filters hidden files and sorts the bounded catalog supplied by Rust, then submits only an ordered visible EntryId sequence for Rust to render. Rust RootSession lifetime follows ordinary strong/weak ownership rather than policy-driven retention or eviction. FRED supports only explicitly validated Neovim 0.12 patch-version and pinned `nvim-oxi` revision pairs. It does not publish precompiled binaries or provide a pure-Lua fallback.
 
 The view is a flat list of complete root-relative paths. It is not an indented tree, sidebar, or connector-glyph hierarchy. A view may materialize different directories to different depths while every displayed line remains a complete path.
 
@@ -40,7 +40,7 @@ FRED must:
 2. Display root-relative entries in a flat, editable buffer.
 3. Support a baseline recursion depth plus per-directory expansion and collapse.
 4. Support sorting, hidden-file controls, ignore rules, bounded scanning, and partial views.
-5. Let ordinary text edits express file and directory creation, rename, move, copy, replacement, and deletion.
+5. Let ordinary text edits express file and directory creation, rename, move, copy, replacement, and deletion, with the user's ordinary write of the current visible Open FRED buffer as the sole buffer-planned mutation entrypoint.
 6. Capture copy provenance from ordinary Vim yank and put operations where Neovim exposes or FRED wraps the operation.
 7. Track entry identity independently of its current path.
 8. Treat directory copy, move, and deletion as single logical tree operations rather than per-descendant plans.
@@ -50,17 +50,17 @@ FRED must:
 12. Reject invalid paths, missing sources, wrong source kinds, required parents that neither exist nor are created by the same plan, and occupied destinations before mutation.
 13. Never silently overwrite an existing destination.
 14. Preview every non-empty operation plan and require one all-or-nothing confirmation.
-15. Permit only one FRED mutation anywhere in the Neovim process at a time.
+15. Permit only one FRED mutation anywhere in the Neovim process at a time, whether entered through the current buffer's write handler or `:FredLink`.
 16. Execute filesystem operations serially and stop immediately on the first execution error.
 17. Refresh affected views after success or failure on a best-effort basis.
 18. Remain responsive while scanning, copying, and rendering large directory sets.
 19. Expose a stable Lua Instance lifecycle with explicit actions, buffer metadata, attach callbacks, and layout-independent display control.
 20. Build from source for validated Neovim and `nvim-oxi` combinations.
 21. Render optional metadata columns such as icons, permissions, size, and timestamps without changing editable path syntax.
-22. Bound in-memory scan and metadata cache retention with explicit time, memory, and entry-count cleanup policies.
+22. Release the whole RootSession and its snapshots, metadata/cache state, watcher coverage, and provisional work naturally through strong-reference ownership; scan limits bound each requested generation but do not promise a cumulative memory bound for a still-live RootSession.
 23. Let one instance own one editable buffer while displaying that buffer in multiple windows and sharing RootSession data by reference.
 24. Let users create named or unnamed instances, inherit configuration, choose action functions per keymap mode, and reveal files through normal flat expansion.
-25. Automatically destroy undisplayed instances after their configured delay while discarding only unapplied buffer state and never mutating the filesystem.
+25. Destroy Hidden instances through exactly two Lua-owned, OR-combined triggers: their per-instance hidden delay and their setup-defined cleanup-group LRU capacity, while discarding only unapplied buffer state and never mutating the filesystem.
 
 ## 3. Non-Goals For Version One
 
@@ -85,6 +85,7 @@ Version one will not:
 - provide Dired-style persistent marks, arbitrary shell commands, recursive grep, archive management, or image galleries;
 - silently overwrite an existing destination;
 - provide a generic temporary text-filter feature; hidden-file visibility uses `view.hidden_files_visible` and `is_hidden_file` instead;
+- provide a public apply/save method, command, action, or mapping outside ordinary current-buffer write handling;
 - treat sorting, hidden-file display, ignoring, expansion, collapse, layout, reveal, or navigation changes as filesystem operations.
 
 These constraints keep version one centered on paths, identity, immutable snapshots, views, desired-state planning, and a small fail-stop executor.
@@ -103,13 +104,15 @@ FRED therefore borrows concepts, not runtime modules or private interfaces. If a
 
 The implementation and tests must preserve these invariants.
 
-### 5.1 Buffer Intent Mutates Only After Confirmed Write
+### 5.1 Buffer Intent Mutates Only After Confirmed Current-Buffer Write
 
 Editing, deleting, putting, expanding, collapsing, sorting, changing hidden-file visibility, refreshing, revealing, navigating, hiding, or destroying a FRED buffer does not mutate the filesystem by itself.
 
+The only buffer-planned filesystem mutation entrypoint is the user's ordinary write of the current FRED buffer through that buffer's Lua `BufWriteCmd` handler. Standard full-buffer write variants such as `:write`, `:update`, and `:wq` may share the handler. The `BufWriteCmd` handler rejects a target filename different from the FRED buffer's private URI. Buffer-local `FileWriteCmd` and `FileAppendCmd` handlers reject ranged and append writes before ordinary Neovim file I/O; they never capture intent or enter planning, confirmation, locking, or execution. One write processes only the current Instance, never all loaded instances. The planning handler first validates that the current buffer is exactly that Instance's buffer and that the Instance is Open and displayed; Created, Hidden, Destroyed, non-current, alternate-target, ranged, and append-write cases cannot enter planning or execution.
+
 A non-empty FRED buffer plan may mutate only after:
 
-1. the user invokes `:write` or `:FredApply`;
+1. the user invokes an accepted ordinary write variant for the current visible Open FRED buffer;
 2. current buffer edits are captured;
 3. the planner returns a valid plan;
 4. the complete logical plan is shown;
@@ -118,7 +121,7 @@ A non-empty FRED buffer plan may mutate only after:
 7. the plan's `edit_base_revision` matches the initiating View's current edit base, its `planned_root_revision` matches the RootSession's current published revision, and changedtick plus intent generation still match;
 8. direct namespace probes are repeated under the lock and final preflight succeeds.
 
-`:FredLink` is an explicit immediate helper outside the buffer planner. It is the only version-one FRED command that intentionally mutates without `:write`, and it must acquire the same process-global mutation lock.
+There is no public Instance apply/save method, apply action, apply command, or default apply mapping. Internal Apply task-state and apply-pipeline terminology may describe this write-driven implementation but does not create another entrypoint. `:FredLink` is the sole immediate mutation helper outside buffer write and must acquire the same process-global mutation lock.
 
 ### 5.2 Projection Absence Is Not Deletion
 
@@ -146,7 +149,7 @@ Watcher failure produces a visible degraded state. Direct final preflight remain
 
 ### 5.6 Only One FRED Mutation Runs At A Time
 
-One process-global mutation lock covers all RootSessions, Views, public API apply calls, mappings, callbacks, and `:FredLink`.
+One process-global mutation lock covers all RootSessions and every mutation entered through a FRED buffer's `BufWriteCmd` handler or `:FredLink`.
 
 The lock is acquired after preview confirmation and before final preflight. It remains held through serial execution and result publication. Preview does not hold the lock.
 
@@ -174,11 +177,13 @@ System API success is trusted. Completed execution-node results are applied dete
 
 ### 5.10 Instance Destruction Discards Only Unapplied Buffer State
 
-An instance may lose every displaying window while its buffer remains loaded and modified. That transition starts the instance cleanup delay; it does not apply, discard, confirm, or mutate the filesystem. The user may reopen the buffer and apply before the timer expires.
+An instance may lose every displaying window while its buffer remains loaded and modified. `Open -> Hidden` inserts it as the newest member of its configured cleanup-group LRU and, when `delay_ms > 0`, starts its one-shot hidden timer. Neither action applies, discards, confirms, or mutates the filesystem. The user may reopen the buffer and write it before either cleanup trigger destroys it.
 
-When explicit destruction, external buffer wipeout, or the cleanup timer destroys the instance, FRED discards that buffer text, View intent, undo history, and edit-base reference. Shared RootSession data is released by reference counting and remains alive while any other instance or task requires it. Destroying unapplied text is not a filesystem operation and never enters planner or executor flow.
+Exactly two OR-combined automatic destroy triggers exist for a Hidden instance: expiration of its per-instance hidden delay and overflow of its setup-defined group capacity. `Hidden -> Open` removes the instance from the LRU and cancels its timer; rehiding reinserts it as newest. Capacity enforcement destroys the oldest Hidden instances through the same idempotent terminal destroy path until the group is within capacity. `capacity = 0` retains no Hidden instances, while `delay_ms = 0` disables only the timer. Cleanup is entirely Lua-owned and applies only to Instance lifecycle.
 
-One instance owns one buffer and View. Multiple windows may display that buffer, and the cleanup timer cannot run while any window still displays it.
+When explicit destruction, external buffer wipeout, timer expiry, or group eviction destroys the instance, FRED discards that buffer text, View intent, undo history, and edit-base reference and detaches its View. Rust knows nothing about cleanup timers, groups, or capacities. The RootSession registry retains only Weak references; attached Views and active tasks retain strong references. Detaching the last View cancels root work that has no consumers. After active tasks release their final references, the RootSession, snapshots, metadata/cache state, and watchers drop naturally. Destroying unapplied text is not a filesystem operation and never enters planner or executor flow.
+
+One instance owns one buffer and View. Multiple windows may display that buffer, and a displayed/Open instance is never a cleanup-group LRU member and has no running hidden timer.
 
 ## 6. Platform, Build, And Runtime Architecture
 
@@ -220,7 +225,7 @@ Upgrading Neovim or the pinned `nvim-oxi` revision may require rebuilding FRED. 
 Rust owns:
 
 - canonical paths, immutable snapshots, RootSession, View, identity, provenance, intent, conflict, and validation state;
-- scanning, metadata collection, watching, coverage, planning, execution, refresh, and shared cleanup accounting;
+- scanning, metadata collection, watching, coverage, planning, execution, refresh, and ordinary strong-reference ownership of RootSession state;
 - bounded catalog batches for every entry in the View-requested scopes, including entries that Lua may classify as hidden;
 - generation/revision-bound one-shot order validation and keyed buffer, range-extmark, virtual-text, cursor, and dirty-row reconciliation;
 - buffer parsing, direct namespace probes, and the process-global mutation gate through one internal `nvim_adapter` for every direct Neovim call;
@@ -232,7 +237,7 @@ Lua owns:
 - `setup()` configuration capture and direct/child instance inheritance;
 - the public Instance object and live-instance registry lookups;
 - action functions, mode-grouped buffer-local keymaps, FileType metadata, and `on_attach`;
-- native Neovim layout construction, window ownership, open/hide/toggle/focus behavior, highlight definitions, and Neovim lifecycle autocmds;
+- native Neovim layout construction, window ownership, open/hide/toggle/focus behavior, highlight definitions, Neovim lifecycle autocmds, and all Instance cleanup timers/group LRUs;
 - per-instance presentation state and the current View catalog mirror;
 - `is_hidden_file` evaluation, hidden-directory subtree propagation, stable single-key sorting, and submission of ordered visible EntryIds.
 
@@ -260,7 +265,7 @@ Rules:
 - scans do not publish a competing snapshot while that RootSession is applying;
 - watcher events received during apply are coalesced for the post-apply refresh;
 - every post-lock outcome, including final-preflight failure, leaves Apply through one common finalization path that processes queued refresh demand before releasing the global mutation lock;
-- another apply or `:FredLink` receives a busy error while the global mutation lock is held.
+- another FRED buffer write or `:FredLink` receives a busy error while the global mutation lock is held.
 
 Long work uses:
 
@@ -327,7 +332,6 @@ instance:focus(opts)
 instance:destroy()
 
 instance:refresh()
-instance:apply()
 instance:reveal(relative_path, opts)
 instance:reveal_current_file(opts)
 instance:navigate(relative_directory)
@@ -359,13 +363,13 @@ parent instance resolved configuration
   + explicit child options
 ```
 
-The current presentation values become part of the child's immutable construction snapshot; later parent changes do not update the child. Explicit child options override the copied values. SortSpec is an explicit exception to every deep-merge rule: a setup SortSpec, direct-instance override, copied parent-current SortSpec, or explicit child override is independently validated as a table containing exactly `by`, `direction`, and `case_sensitive`, and the selected table replaces the previous SortSpec wholesale. No SortSpec field is inherited from another table. This inheritance keeps columns, keymaps, layout, cleanup, presentation behavior, and callbacks consistent while navigating through newly created instances. The inherited `on_attach` list already contains setup callbacks and is not prefixed with setup callbacks a second time.
+The current presentation values become part of the child's immutable construction snapshot; later parent changes do not update the child. Explicit child options override the copied values. SortSpec is an explicit exception to every deep-merge rule: a setup SortSpec, direct-instance override, copied parent-current SortSpec, or explicit child override is independently validated as a table containing exactly `by`, `direction`, and `case_sensitive`, and the selected table replaces the previous SortSpec wholesale. No SortSpec field is inherited from another table. This inheritance keeps columns, keymaps, layout, resolved `cleanup.instance` values, presentation behavior, and callbacks consistent while navigating through newly created instances. Setup-only `cleanup.groups` is not copied into direct or child Instance options and is immutable after setup. The inherited `on_attach` list already contains setup callbacks and is not prefixed with setup callbacks a second time.
 
 `name` is optional. Every instance has an opaque unique InstanceId; a non-empty name must be unique among live instances. Creating a second live instance with the same name is an explicit error. Destroying the old instance releases the name for reuse. Automatically created child instances are unnamed unless the action supplies a name.
 
 The resolved configuration is immutable after `new()`. `instance:config()` returns a read-only construction snapshot; `instance:hidden_files_visible()` and `instance:sort()` return read-only copies of committed runtime presentation state. Runtime changes use explicit methods such as `set_columns`, `set_hidden_files_visible`, `set_sort`, `navigate`, and per-call `open({ layout = ... })`; FRED does not expose a generic `set_config()` or `update_config()`.
 
-In Created state, presentation setters only validate and update Lua PresentationState. There is no View or catalog yet, so they perform no intent capture, metadata request, ordered-ID submission, buffer synchronization, or history reset. `open()` creates the View from those values. Open and lifecycle-Hidden instances use the transaction rules in Section 13. Destroyed instances reject presentation operations through the ordinary lifecycle guard.
+In Created state, presentation setters only validate and update Lua PresentationState. There is no View or catalog yet, so they perform no intent capture, metadata request, ordered-ID submission, buffer synchronization, or history reset. `open()` creates the View from those values. Open and lifecycle-Hidden instances use the transaction rules in Section 13. Destroyed instances reject presentation operations through the ordinary lifecycle guard. `instance:refresh()` is separate: it accepts any Open Instance with at least one valid display, even when its buffer is not current. `:FredRefresh` is current-buffer-only and validates that the current buffer belongs to a visible Open FRED Instance.
 
 ### 7.2 Instance, Buffer, Window, And Lifecycle Model
 
@@ -380,7 +384,8 @@ Instance
   buffer: zero or one
   View: zero or one
   windows: zero or more
-  cleanup timer
+  hidden cleanup timer
+  cleanup group and optional Hidden-LRU membership
 ```
 
 Multiple instances may point at the same canonical root. They own distinct buffers, Views, intent, undo history, columns, expansion state, and Lua presentation state while sharing the root's immutable snapshots, scan cache, metadata cache, and watcher coverage through RootSession references.
@@ -395,10 +400,10 @@ Open
   buffer exists and at least one window displays it
 
 Hidden
-  buffer exists and no window displays it; instance cleanup timer may run
+  buffer exists and no window displays it; instance is in its group's LRU and its hidden timer may run
 
 Destroyed
-  terminal state; buffer, View, windows, timers, name registration, and RootSession references are released
+  terminal state; buffer, View, windows, timers, group membership, name registration, and RootSession references are released
 ```
 
 Transitions are driven by observed Neovim state as well as instance methods:
@@ -408,28 +413,37 @@ new()                         -> Created
 open()                        -> Open
 last displaying window gone  -> Hidden
 open() while Hidden           -> Open
+group capacity overflow       -> Destroyed
 cleanup delay expires         -> Destroyed
 buffer delete or wipeout      -> Destroyed
 destroy()                     -> Destroyed
 ```
 
-Fred uses `WinNew`, `BufWinEnter`, `WinEnter`, `WinClosed`, and `BufHidden` as display-reconciliation triggers; event-local counters are not authoritative. Reconciliation derives displays from valid windows that actually contain the instance buffer. Because `WinClosed` fires before the closing window disappears from window queries, its reconciliation is deferred to the next main-loop turn. Any reconciled window displaying the buffer cancels the cleanup timer, and the timer starts only after reconciliation finds no display. A validated `BufDelete` or `BufWipeout` for the instance's current buffer bypasses display reconciliation and invokes the terminal destroy path directly.
+Fred uses `WinNew`, `BufWinEnter`, `WinEnter`, `WinClosed`, and `BufHidden` as display-reconciliation triggers; event-local counters are not authoritative. Reconciliation derives displays from valid windows that actually contain the instance buffer. Because `WinClosed` fires before the closing window disappears from window queries, its reconciliation is deferred to the next main-loop turn. A validated `BufDelete` or `BufWipeout` for the instance's current buffer bypasses display reconciliation and invokes the terminal destroy path directly.
 
-Instance cleanup is configured per instance:
+Instance cleanup is configured with inherited per-instance values and setup-only groups:
 
 ```lua
 cleanup = {
   instance = {
     delay_ms = 300000,
+    group = "default",
+  },
+  groups = {
+    default = {
+      capacity = 10,
+    },
   },
 }
 ```
 
-`delay_ms` is not keyboard-idle time. It is the delay after the buffer ceases to be displayed anywhere. Reopening the buffer cancels the timer. `delay_ms = 0` disables automatic instance destruction.
+`cleanup.instance` is resolved into each direct or child Instance. `delay_ms` is not keyboard-idle time; it is a one-shot delay beginning on `Open -> Hidden`. `group` must name a setup-defined group, and an unknown group fails during `new()` validation. `cleanup.groups` is setup-only, process-wide, and immutable after setup; direct and child options cannot override or define it.
 
-When the timer expires, FRED calls the instance's terminal destroy path. Unapplied buffer edits and intent are discarded without mutating the filesystem. FRED does not prompt, auto-apply, or block navigation merely because the old instance buffer is modified: the user may return to that buffer and apply before destruction, or allow the instance to expire and discard the edits. Shared snapshots and cache data remain protected while the live dirty View references them; destroying the instance intentionally drops that View and releases its references.
+On `Open -> Hidden`, Lua inserts the Instance as newest in its group's LRU, starts its timer only when `delay_ms > 0`, and immediately enforces capacity by destroying oldest Hidden members until within the group's limit. `capacity = 0` therefore retains no Hidden instances. On `Hidden -> Open`, Lua removes the Instance from the LRU and cancels its timer. Rehiding starts a fresh one-shot timer and reinserts it as newest. Timer expiry and LRU eviction both call one idempotent terminal destroy path, so races between them are harmless. No other automatic destroy trigger exists.
 
-A forced external buffer deletion has the same discard semantics. This is not filesystem undo or recovery: text that was never successfully applied simply ceases to exist with the destroyed buffer.
+Unapplied buffer edits and intent are discarded without mutating the filesystem. FRED does not prompt, auto-write, or block navigation merely because the old instance buffer is modified: the user may return to that buffer and write it before destruction, or allow cleanup to discard the edits. A forced external buffer deletion has the same discard semantics. This is not filesystem undo or recovery: text that was never successfully written simply ceases to exist with the destroyed buffer.
+
+Destroy detaches the View from its RootSession. The registry's Weak reference does not keep the RootSession alive; other Views and active tasks do. Last-View detach cancels work with no consumers, and final task release naturally drops the RootSession and all Rust-owned snapshots, metadata/cache state, and watchers.
 
 Each View buffer uses a private URI containing the canonical current root and opaque instance/View identity, for example:
 
@@ -493,7 +507,7 @@ otherwise: open(opts), using opts.layout or the instance default
 
 This internal multi-window hide is specific to `toggle`; other tabpages are unaffected and no public hide-all API is added.
 
-The default directory-selection action creates a child instance, creates its buffer, and transfers the triggering Fred window to that child buffer instead of stacking another float or split. The parent loses that window, becomes Hidden if no other window displays it, and starts its cleanup timer. Window buffer replacement uses normal Neovim behavior; FRED does not maintain a separate back/forward history or override native buffer, alternate-buffer, or jumplist behavior.
+The default directory-selection action creates a child instance, creates its buffer, and transfers the triggering Fred window to that child buffer instead of stacking another float or split. The parent loses that window, becomes Hidden if no other window displays it, enters its cleanup-group LRU as newest, and starts its timer when enabled. Window buffer replacement uses normal Neovim behavior; FRED does not maintain a separate back/forward history or override native buffer, alternate-buffer, or jumplist behavior.
 
 ### 7.4 Filetype And Buffer Metadata
 
@@ -692,7 +706,6 @@ require("fred").setup({
       ["zO"] = actions.expand_recursive,
       ["zC"] = actions.collapse_recursive,
       ["R"] = actions.refresh,
-      ["<leader>s"] = actions.apply,
       ["q"] = actions.hide,
       ["g."] = actions.toggle_hidden_files,
     },
@@ -750,12 +763,11 @@ end
 
 The default directory handler is `open_new_instance`; users may replace it with `navigate` or any custom function. Missing handlers and invocation without a valid entry are explicit errors.
 
-Commands remain convenience entry points over instances and actions:
+Commands remain convenience entry points over instances and actions. There is no apply/save command or action; buffer-planned mutation is entered only by writing the current Open FRED buffer:
 
 ```text
 :Fred [root]                 create an unnamed instance and open it
-:FredApply                   apply the current Fred instance
-:FredRefresh                 refresh the current Fred instance
+:FredRefresh                 refresh the current visible Open Fred instance
 :FredDepth {n|all}           change baseline recursion depth
 :FredExpand [depth]          expand the current directory
 :FredCollapse                collapse the current directory
@@ -828,37 +840,47 @@ init.lua
 lib/
 ```
 
-`navigate` is not another expansion operation. Because one instance owns one buffer, direct same-instance navigation requires a clean View; the default directory action creates a new instance instead, allowing the old dirty buffer to remain available for later apply until its cleanup timer destroys it.
+`navigate` is not another expansion operation. Because one instance owns one buffer, direct same-instance navigation requires a clean View; the default directory action creates a new instance instead, allowing the old dirty buffer to remain available for a later current-buffer write until either Hidden cleanup trigger destroys it.
 
 ### 7.9 Write Semantics
 
-Full-buffer `:write`, `:update`, and `:wq` invoke the same apply behavior as `instance:apply()` and `:FredApply`.
+The only buffer-planned filesystem mutation entry is a user's ordinary full-buffer write of the current visible Open FRED buffer. `:write`, `:update`, and `:wq` may invoke the same buffer-local Lua `BufWriteCmd` handler. One invocation processes only the Instance that owns that current buffer; it never discovers, batches, or writes other loaded FRED instances. FRED exposes no public apply/save method, command, action, mapping, or replacement entrypoint.
 
-The Lua `BufWriteCmd` handler starts the confirmation/apply pipeline and does not return to the write command until that attempt reaches a terminal result. It may pump the Neovim event loop while Rust workers run, but the pipeline does not mutate buffer lines while the callback is active. One post-apply View synchronizer owns reprojection, edit-capture suppression, `'modified'`, and the new undo baseline.
+Every FRED buffer installs three buffer-local write-command handlers. `BufWriteCmd` is the sole planning handler. `FileWriteCmd` always rejects ranged writes, and `FileAppendCmd` always rejects append writes; because these command autocmds replace Neovim's ordinary operation, both errors occur before any ordinary file I/O. The two rejection handlers do not capture intent, plan, preview, acquire the mutation lock, or mutate the filesystem.
+
+Before planning, the `BufWriteCmd` handler validates all of the following:
+
+- the event buffer is the current buffer;
+- the buffer is the initiating Instance's registered buffer;
+- the Instance is Open and at least one valid window displays that buffer;
+- the command's target filename is exactly the FRED buffer's private URI after the same normalization used for buffer identity.
+
+An alternate target filename is rejected rather than treated as an export. A Hidden Instance cannot enter the write/apply pipeline or refresh. The user must reopen it, making it Open and displayed, before `:write`, `instance:refresh()`, or `:FredRefresh` is accepted; only the write and `:FredRefresh` additionally require that buffer to be current.
+
+The Lua `BufWriteCmd` handler starts the internal confirmation/apply pipeline and does not return to the write command until that attempt reaches a terminal result. It may pump the Neovim event loop while Rust workers run, but the pipeline does not mutate buffer lines while the callback is active. One deferred post-write View synchronizer owns reprojection, edit-capture suppression, `'modified'`, and the new undo baseline. Every pending projection is tagged with the initiating Instance and View identities and generations.
 
 Write outcomes are explicit:
 
-- successful apply or a successful empty plan records a pending clean projection, clears `'modified'`, and returns write success;
+- successful execution or a successful empty plan records a pending clean projection, clears `'modified'`, and returns write success;
 - cancellation or any pre-execution failure records no projection, leaves `'modified'` set, and returns without write success;
 - execution failure records a pending clean projection from the model containing only completed effects, clears `'modified'` because failed/unstarted intent is abandoned, and reports write failure so `:wq` remains open.
 
-After `BufWriteCmd` returns, the synchronizer applies any pending projection with edit capture suppressed, establishes the ordinary undo baseline, and restores the outcome's intended `'modified'` value. A direct `instance:apply()` or `:FredApply` invocation uses the same synchronizer immediately when no command-event restriction is active.
+After `BufWriteCmd` returns, the deferred synchronizer first validates that the same live Instance and View still exist and that both generations match the pending projection. Only then does it apply the projection with edit capture suppressed, establish the ordinary undo baseline, and restore the outcome's intended `'modified'` value. Terminal destroy invalidates those generations and cancels/discards the pending projection, so a scheduled synchronizer that observes missing or mismatched identity is a no-op. In particular, if a successful `:wq` hides the buffer and Hidden cleanup such as `capacity = 0` destroys the Instance before synchronization runs, the filesystem result remains complete while the projection is discarded. FRED adds no recovery state, pending-destroy state, or buffer resurrection for this race.
 
 Rules:
 
 - every non-empty plan is previewed and confirmed;
-- `:wq` closes only after successful apply or a successful empty plan;
+- `:wq` closes only after successful execution or a successful empty plan;
 - preview cancellation, validation failure, stale-plan failure, lock contention, or final-preflight failure leaves `'modified'` set;
-- successful apply produces a clean synchronized View and a new ordinary undo baseline through the post-apply synchronizer;
+- successful execution produces a clean synchronized View and a new ordinary undo baseline through the post-apply synchronizer;
 - an empty plan records a synchronized model, produces a clean reprojected and sorted View through the same synchronizer, and returns without preview;
-- alternate-file writes, ranged writes, and append writes are rejected;
-- hiding an instance or transferring its window does not apply, discard, or prompt; the hidden buffer remains editable state until reopened or destroyed;
-- destroying an instance discards unapplied buffer text and intent without filesystem mutation;
+- hiding an instance or transferring its window does not write, discard, or prompt; the Hidden buffer remains editable state until reopened or destroyed;
+- destroying an instance discards unwritten buffer text and intent without filesystem mutation;
 - FRED does not export its path list through ordinary write syntax.
 
 Hidden-file visibility changes are presentation synchronizations, not writes. A setter that supplies the already-committed boolean is a no-op. Every actual boolean change captures current intent and, after Rust reconciles the atomic ordered-ID submission, clears Neovim undo history and establishes a new baseline even when visible real-row membership/order happens to remain unchanged. Existing intent and `'modified'` survive. An identical normalized SortSpec is also a no-op. A different SortSpec updates presentation state, but clears history only when its committed result actually changes real-row order.
 
-Normal Vim editing remains the primary interface for create, rename, move, copy, replacement, and delete.
+Normal Vim editing remains the primary interface for create, rename, move, copy, replacement, and delete; writing the current Open FRED buffer is the only way those edits enter planning and execution.
 
 ## 8. Expressing File Operations
 
@@ -1082,9 +1104,7 @@ A published filesystem snapshot is immutable and carries a monotonically increas
 
 Provisional batches and individual scopes may render as they arrive, but a generation publishes exactly one new immutable `current_snapshot` only after every requested scope reaches a terminal complete, partial, or failed result. Partial and failed scopes remain explicitly non-authoritative inside that single published result. Late or cancelled generations cannot publish, and provisional data never updates a View's edit base.
 
-Published snapshots remain alive while referenced by dirty Views and are released when no View needs them. Namespace snapshots contain identity, path, kind, coverage authority, and scan status; optional permission, size, and timestamp observations live in a separate RootSession metadata cache with its own monotonically increasing `metadata_revision`. Metadata enrichment or eviction may re-render columns without advancing `root_revision` or any View edit base.
-
-Cleanup may release only cache objects that are not protected by the current RootSession, an attached View's edit base, pending intent or diagnostics, an active scan/apply task, or watcher coverage. This protection rule applies uniformly to scan-cache rows, metadata records, provisional batches, and obsolete snapshots.
+Published snapshots remain alive while referenced by Views or active tasks and are released when the last strong reference disappears. Namespace snapshots contain identity, path, kind, coverage authority, and scan status; optional permission, size, and timestamp observations live in a separate RootSession metadata cache with its own monotonically increasing `metadata_revision`. Metadata enrichment may re-render columns without advancing `root_revision` or any View edit base. Cancelled or superseded work releases provisional state promptly through ordinary ownership.
 
 ### 10.2 RootSession
 
@@ -1100,8 +1120,6 @@ RootSession {
   metadata_revision
   scan_generation
   metadata_generation
-  cache_usage: { estimated_bytes, cached_entry_count }
-  cleanup_lru
   directory_status
   watcher_state
   coverage_reference_counts
@@ -1110,7 +1128,7 @@ RootSession {
 }
 ```
 
-The RootSession does not own a mutation lock. The mutation lock is process-global because different canonical roots can overlap.
+The RootSession does not own a mutation lock. The mutation lock is process-global because different canonical roots can overlap. The runtime registry stores only `Weak<RootSession>` values; attached Views and active scan, metadata, apply, and watcher tasks hold `Arc<RootSession>` strong references. Last-View detach cancels work with no consumers, and the RootSession plus snapshots, metadata/cache state, and watchers drop naturally after tasks release the final strong reference. Rust implements no RootSession cleanup policy, timer, capacity, or LRU.
 
 ### 10.3 Instance
 
@@ -1129,11 +1147,13 @@ Instance {
   bufnr: optional
   view_id: optional
   displayed_windows: Map<winid, LayoutHandle>
-  cleanup_timer: optional
+  hidden_cleanup_timer: optional
+  cleanup_group
+  hidden_lru_membership: optional
 }
 ```
 
-The Instance owns its one buffer/View lifecycle and holds references to whichever RootSession matches `current_root`. Window count is derived from actual windows displaying the buffer, not from keyboard activity. Named and buffer-based registry lookups validate that the live runtime identity still matches rather than trusting reusable names or buffer numbers.
+The Instance owns its one buffer/View lifecycle, inherits resolved `cleanup.instance` values, and holds references to whichever RootSession matches `current_root`. Window count is derived from actual windows displaying the buffer, not from keyboard activity. Named and buffer-based registry lookups validate that the live runtime identity still matches rather than trusting reusable names or buffer numbers.
 
 ### 10.4 View And Presentation State
 
@@ -1219,7 +1239,7 @@ File contents, permissions, size, and timestamps are not part of this conflict m
 
 The runtime owns authoritative registries keyed by opaque `instance_id` and `view_id`, with validated secondary lookups by optional unique name and `bufnr`.
 
-Window entry/exit updates the Instance's display handles and cleanup timer without changing View intent. Hiding or transferring every window leaves the buffer/View alive in Hidden state. Buffer wipeout, explicit destroy, or instance-delay expiration invalidates the Instance and View generations, discards unapplied text/intent, releases coverage and edit-base references, cancels instance-owned timers/tasks, and detaches from RootSession. Async events carry instance, root, View, and generation identity rather than trusting reusable window or buffer numbers.
+Window entry/exit updates the Instance's display handles and Lua-owned cleanup state without changing View intent. Hiding or transferring every window leaves the buffer/View alive in Hidden state, inserts the Instance as newest in its configured group LRU, starts its timer when enabled, and enforces group capacity. Reopening removes it from the LRU and cancels the timer. Buffer wipeout, explicit destroy, timer expiration, or LRU eviction enters one idempotent terminal destroy path that invalidates the Instance and View generations, discards unwritten text/intent, releases coverage and edit-base references, cancels instance-owned timers/tasks, removes group membership, and detaches from RootSession. Async events carry instance, root, View, and generation identity rather than trusting reusable window or buffer numbers.
 
 Same-instance `navigate` requires a clean View, invalidates only the old View generation, keeps InstanceId/buffer/windows/configuration/current presentation state, attaches a new View to the destination RootSession, updates buffer metadata, and resets the undo baseline. Creating a child instance instead leaves the parent View—including dirty text—intact until it is reopened or destroyed.
 
@@ -1327,7 +1347,7 @@ Hidden-file visibility and Lua filtering do not reduce or expand coverage and ne
 
 Coverage is reference-counted. When no attached View needs a directory, its watcher may be released and its cached state may cease to be authoritative. COPY_TREE and DELETE_TREE do not add descendant enumeration coverage.
 
-Metadata requirements are also reference-counted as the union of attached View columns and Lua presentation SortSpecs. Removing a column or changing sort may release its metadata requirement without reducing directory coverage. Optional metadata that no View requires becomes eligible for cleanup, while namespace entry identity, path, kind, and coverage authority remain intact.
+Metadata requirements are also reference-counted as the union of attached View columns and Lua presentation SortSpecs. Removing a column or changing sort reduces future metadata requirements without reducing directory coverage, but it does not promise object-level pruning of metadata already retained by a still-live RootSession. Namespace entry identity, path, kind, coverage authority, and previously cached metadata may remain until the whole RootSession is released.
 
 ### 12.3 Watcher Behavior
 
@@ -1337,41 +1357,15 @@ FRED-generated mutations also produce watcher events. The executor reports affec
 
 If watcher coverage cannot be established, FRED displays a degraded warning and leaves manual refresh available. Missing watcher coverage alone does not prevent apply.
 
-### 12.4 Shared Cache Cleanup Policy
+### 12.4 RootSession Ownership And Natural Release
 
-FRED has no persistent disk cache in version one. Shared cleanup governs Rust-owned scan entries, per-entry metadata, provisional scan batches, and obsolete snapshots retained by references. It is distinct from per-instance `cleanup.instance.delay_ms`, and it never deletes a buffer, Instance, View, or filesystem entry.
+FRED has no persistent disk cache in version one and no Rust retention or eviction policy. Rust knows nothing about Instance timers, cleanup groups, LRU capacity, idle age, estimated memory, or cache entry-count thresholds.
 
-Reference ownership is authoritative. Current snapshots, live View edit bases, active scan/apply tasks, watcher coverage, diagnostics, pending intent, and precise reveal coverage protect the shared objects they reference. Destroying an instance intentionally drops its View references; other instances continue to protect shared data independently.
+The RootSession registry retains Weak references so registry membership alone never extends a session's lifetime. Attached Views and active tasks retain strong references to the RootSession and thereby to the snapshots, metadata/cache state, and watcher resources they require. When a View detaches, it releases its coverage, edit-base, intent, and diagnostic references. If it was the last View, the runtime cancels root work that has no remaining consumers. Ordinary cancellation and generation replacement release provisional scan and metadata state promptly through ownership.
 
-`cached_entry_count` counts namespace rows retained by `scan_cache`; attached metadata records do not add another count, and provisional batches plus snapshots are not part of this count. `estimated_bytes` includes scan-cache rows, metadata records, provisional batches, and uniquely owned retained snapshots.
+Once active tasks release the final strong RootSession reference, the RootSession, current and obsolete snapshots, metadata/cache state, coverage bookkeeping, and watchers drop naturally. There is no object-level cleanup or pruning, periodic sweeper, LRU, estimated-memory policy, idle-age policy, cached-entry-count policy, or other Rust retention policy.
 
-Cleanup has two layers:
-
-1. Reference cleanup is mandatory. Cancelled or obsolete scan generations release provisional batches immediately. Destroying, navigating, or detaching a View releases its coverage and edit-base references. An object with no protecting reference becomes eligible.
-2. Policy cleanup is opportunistic. A bounded sweeper follows the object-class priority defined below and removes least-recently-used eligible objects within each class when they exceed configured idle age, memory estimate, or entry count.
-
-The setup-level shared policy is:
-
-```lua
-cleanup = {
-  shared = {
-    interval_ms = 30000,
-    max_idle_ms = 300000,
-    max_memory_bytes = 268435456,
-    max_cached_entries = 0,
-  },
-}
-```
-
-Per-instance construction may override `cleanup.instance`, but does not create competing shared-cache policies for one RootSession. Shared policy comes from setup and applies process-wide.
-
-`interval_ms` controls only periodic sweeps. `max_idle_ms` uses each object's monotonic `last_used_at`. `max_memory_bytes` is a soft estimated Rust-owned cache budget. `max_cached_entries` counts only `scan_cache` namespace rows. Every value is a non-negative integer; `0` disables only that condition.
-
-Reference cleanup always runs. Policy cleanup is event-driven after cache insertion, View detach, scan completion/cancellation, and watcher coverage changes whenever any threshold is nonzero. Nonzero `interval_ms` adds timer ticks; `interval_ms = 0` disables only timer ticks, not event-driven enforcement of other thresholds.
-
-Expiry first releases obsolete provisional batches and unreferenced snapshots, then unrequired metadata by oldest `last_used_at`, then uncovered scan-cache rows and attached metadata by oldest `last_used_at`. Entry-count pressure uses only the scan-cache-row class. Memory pressure continues through the same ordered classes until the target is met or no eligible object remains.
-
-Limits are soft when all remaining objects are referenced. FRED never evicts live shared state merely to satisfy a limit. Sweeps are bounded, errors are warnings, and cleanup never blocks apply or mutates the filesystem.
+`max_entries` and `max_directories` bound each requested scan generation, and bounded channels/batches bound provisional task-owned work. They do not bound cumulative cache retained by a still-live RootSession: a long-lived session may retain namespace and metadata state for scopes visited by earlier generations even after current View coverage moves elsewhere. Cancelled or superseded provisional task-owned batches are still released promptly through ordinary ownership, while the only guaranteed release of all retained cache is final whole-RootSession release.
 
 ## 13. Ignore, Hidden Files, Sort, And Depth
 
@@ -1558,9 +1552,9 @@ REPLACE
 
 Each row shows the source, destination, and kind. Tree operations are displayed as one logical row. Cached informational counts may be displayed, but FRED does not enumerate a tree merely to populate preview metadata.
 
-Confirmation is all-or-nothing. The user cannot deselect individual operations because doing so could invalidate dependencies or produce a namespace different from the edited buffer. To omit an operation, the user cancels, edits the buffer, and applies again.
+Confirmation is all-or-nothing. The user cannot deselect individual operations because doing so could invalidate dependencies or produce a namespace different from the edited buffer. To omit an operation, the user cancels, edits the buffer, and writes the current Open buffer again.
 
-Every valid non-empty plan uses this single confirmation. An empty valid plan records a clean synchronized projection and returns without opening preview; the post-apply synchronizer applies the reprojection, sorting, `'modified'`, and undo-baseline effects at the invocation-appropriate time.
+Every valid non-empty plan uses this single confirmation. An empty valid plan records a clean synchronized projection and returns without opening preview; after the initiating `BufWriteCmd` returns, the post-apply synchronizer applies the reprojection, sorting, `'modified'`, and undo-baseline effects only if the pending Instance/View generations remain current.
 
 ## 17. Executor And Failure Semantics
 
@@ -1619,7 +1613,7 @@ It then:
 - reports success;
 - exits through the common post-lock finalization path.
 
-The post-apply synchronizer re-renders the initiating View with edit capture suppressed, clears `'modified'`, and establishes the new ordinary undo baseline. It runs after `BufWriteCmd` returns or immediately for a direct apply invocation.
+After `BufWriteCmd` returns, the post-apply synchronizer re-renders the initiating View with edit capture suppressed, clears `'modified'`, and establishes the new ordinary undo baseline only when the pending Instance/View generation token is still current; terminal destruction discards the projection and makes the callback a no-op.
 
 A refresh error is reported through Neovim and may be corrected by a later watcher event or `:FredRefresh`. It does not create a special degraded, unknown, reconciliation-required, or apply-blocking state.
 
@@ -1637,7 +1631,7 @@ On the first execution error, FRED:
 8. shows the execution report;
 9. exits through the common post-lock finalization path.
 
-A failed node is not assumed successful; a later refresh may reveal partial side effects left by that failed system call. The post-apply synchronizer re-renders the updated model with edit capture suppressed, clears `'modified'`, and establishes a new ordinary undo baseline. A `BufWriteCmd` invocation still reports write failure so `:wq` remains open. The user edits the synchronized model and starts a new apply if desired. FRED does not offer an automatic retry action.
+A failed node is not assumed successful; a later refresh may reveal partial side effects left by that failed system call. The post-apply synchronizer re-renders the updated model with edit capture suppressed, clears `'modified'`, and establishes a new ordinary undo baseline. A `BufWriteCmd` invocation still reports write failure so `:wq` remains open. The user edits the synchronized model and writes that current Open buffer again if desired. FRED does not offer an automatic retry action.
 
 Other dirty Views retain their own intent and rebase against the next published snapshot.
 
@@ -1670,7 +1664,7 @@ Rules:
 - ordinary file content, permissions, size, or timestamps changed: not a FRED conflict;
 - external rename: represent conservatively as old-path deletion plus new-path creation.
 
-Watcher events trigger incremental refresh automatically. `:FredRefresh` forces reconciliation of the View's required browse coverage.
+Watcher events trigger incremental refresh automatically. `instance:refresh()` forces reconciliation for any Open Instance with at least one valid display, even when another buffer is current. `:FredRefresh` is a current-buffer convenience command and accepts only the current visible Open FRED buffer. Hidden instances reject both forms and must be reopened first.
 
 A dirty View is never silently overwritten by ordinary refresh. Conflicted entries remain visible regardless of hidden-file settings or collapse.
 
@@ -1726,7 +1720,6 @@ src/
   watcher.rs
   coverage.rs
   columns.rs
-  cleanup.rs
   model.rs
   identity.rs
   provenance.rs
@@ -1763,10 +1756,9 @@ The modules expose small internal interfaces with substantial behavior behind th
 - Rust `nvim_adapter` is the only Rust module that calls `nvim_oxi::api` directly and owns the exact-patch-tested buffer, extmark, virtual-text, changedtick, and main-thread notification bindings;
 - Rust `path` owns canonical buffer/native path conversion and validation;
 - Rust `snapshot` owns immutable revisioned namespace state;
-- Rust `root_session` owns shared scan, watcher, coverage, and cache-accounting state;
+- Rust `root_session` owns shared scan, watcher, coverage, cache state, and strong/weak lifetime boundaries;
 - Rust `metadata` owns platform metadata collection and normalized optional values;
 - Rust `columns` owns built-in column definitions, formatting, alignment, and metadata requirements;
-- Rust `cleanup` owns shared candidate selection, object-class ordering, LRU state, soft limits, and bounded sweeps;
 - Rust `view` owns per-buffer coverage, keyed projection reconciliation, column layout, edit base, intent, conflicts, diagnostics, and protected-row state;
 - Rust `planner`, `tree_ops`, `executor`, and `apply_gate` own mutation planning and execution boundaries;
 - Rust `runtime` owns RootSession/View registration, generation identity, overlap invalidation, and native handles exposed to Lua;
@@ -1775,7 +1767,7 @@ The modules expose small internal interfaces with substantial behavior behind th
 - Lua `registry` owns InstanceId/name/buffer lookup and terminal removal;
 - Lua `actions` and `keymaps` own function-valued actions, context construction, mode/lhs merge, and buffer-local installation;
 - Lua `presentation` owns runtime hidden-file visibility and SortSpec state, generation-tagged catalog mirroring, hidden classification/cache and subtree propagation, stable comparison, and ordered EntryId submission;
-- Lua `lifecycle` and `buffer` own Neovim autocmd-triggered reconciliation, `vim.b.fred`, FileType ordering, attach callbacks, instance timers, and undo-baseline resets requested by presentation commits;
+- Lua `lifecycle` and `buffer` own Neovim autocmd-triggered reconciliation, `vim.b.fred`, FileType ordering, attach callbacks, the buffer-local `BufWriteCmd` planning handler plus `FileWriteCmd`/`FileAppendCmd` rejection handlers, generation-validated deferred post-write synchronization, Instance timers, setup-defined hidden-group LRUs/capacity enforcement, terminal destroy, and undo-baseline resets requested by presentation commits;
 - Lua `layout` constructs native buffer, float, split, vsplit, and tab displays and returns ordinary window ownership records.
 
 Rust module interfaces remain internal. `src/lib.rs` exposes the native module through `nvim-oxi`; `lua/fred/init.lua` exposes the stable Instance facade. No speculative backend or public custom-column seam is exposed in version one.
@@ -1815,12 +1807,12 @@ fred.setup({
   cleanup = {
     instance = {
       delay_ms = 300000,
+      group = "default",
     },
-    shared = {
-      interval_ms = 30000,
-      max_idle_ms = 300000,
-      max_memory_bytes = 268435456,
-      max_cached_entries = 0,
+    groups = {
+      default = {
+        capacity = 10,
+      },
     },
   },
   limits = {
@@ -1841,7 +1833,6 @@ fred.setup({
       ["zO"] = actions.expand_recursive,
       ["zC"] = actions.collapse_recursive,
       ["R"] = actions.refresh,
-      ["<leader>s"] = actions.apply,
       ["q"] = actions.hide,
       ["g."] = actions.toggle_hidden_files,
     },
@@ -1856,7 +1847,7 @@ fred.setup({
 
 Direct `fred.new(opts)` deep-merges setup defaults with explicit instance options, except function/list fields such as `on_attach`, which are normalized and concatenated deliberately, and SortSpec. Every explicitly supplied SortSpec at setup, direct `new()`, or child `new()` is validated independently as exactly `{ by, direction, case_sensitive }` and replaces the previous SortSpec wholesale. `instance:new(opts)` starts from the parent's resolved immutable options, replaces its initial hidden-file visibility and SortSpec with snapshots of the parent's current runtime values, then applies explicit child overrides; an explicit child SortSpec replaces that snapshot rather than merging with it. It does not replay setup callbacks. The resulting child values are part of the child's immutable `config()` snapshot, while later setters affect only its runtime getters.
 
-`cleanup.shared` is setup-only. Supplying it to direct or child `new()` options is invalid; instances override only `cleanup.instance`.
+`cleanup.instance` is inherited through resolved direct/child options and may be overridden per construction. `cleanup.groups` is setup-only, process-wide, and immutable after setup; supplying it to direct or child `new()` options is invalid. Every resolved `cleanup.instance.group` must name a setup-defined group, and unknown groups fail during `new()` validation.
 
 `root` belongs to `new()` options and is not an `open()` option. Direct `fred.new()` defaults it to the current working directory; `parent:new()` defaults it to the parent's current root. `layout` belongs to resolved instance options and may be overridden per `open()`/`toggle()` call. Values are `buffer`, `float`, `split`, `vsplit`, or `tab` in version one. `open({ new_display = true })` is a per-call display option, defaults to `false`, and is never stored in resolved configuration.
 
@@ -1870,9 +1861,9 @@ Direct `fred.new(opts)` deep-merges setup defaults with explicit instance option
 
 Watcher establishment, plan confirmation, and no-follow directory-symlink behavior remain automatic and non-configurable in version one.
 
-`cleanup.instance.delay_ms` is a non-negative integer; `0` disables instance auto-destruction. `cleanup.shared` values are non-negative integers; each `0` disables only its shared condition. `interval_ms = 0` disables timer ticks while other nonzero shared thresholds remain event-driven.
+`cleanup.instance.delay_ms` is a non-negative integer; `0` disables only the hidden-delay timer. `cleanup.instance.group` is a non-empty setup-defined group name. Each `cleanup.groups.<name>.capacity` is a non-negative integer; `0` means that group retains no Hidden instances. Timer expiry and group overflow are the only automatic destroy triggers and both use the same idempotent terminal path.
 
-Setup validates instance names/options, layout values, keymap mode/lhs/function shapes, action selectors, attach callback lists, `hidden_files_visible`, the `is_hidden_file` callback, complete SortSpecs, columns, time formats, limits, and cleanup values. Invalid configuration produces explicit errors rather than silent fallback.
+Setup validates instance names/options, layout values, keymap mode/lhs/function shapes, action selectors, attach callback lists, `hidden_files_visible`, the `is_hidden_file` callback, complete SortSpecs, columns, time formats, limits, cleanup groups/capacities, and cleanup instance values. Invalid configuration produces explicit errors rather than silent fallback.
 
 ## 22. Error Handling
 
@@ -1882,9 +1873,9 @@ Errors fall into six classes.
 
 The buffer remains readable. Failed or limited browse scopes are marked partial or degraded. Manual refresh and scope reduction remain available.
 
-Scan or watcher failure does not globally disable apply. A plan is blocked only when its own required source, destination, or parent state cannot be checked.
+Scan or watcher failure does not globally disable the write-driven apply pipeline. A plan is blocked only when its own required source, destination, or parent state cannot be checked.
 
-Cache cleanup is best effort. An individual metadata read or cache release failure is reported without invalidating the namespace snapshot, disabling apply, or deleting filesystem data.
+An individual metadata read failure is reported without invalidating the namespace snapshot, disabling a later valid write, or deleting filesystem data. Cancelled provisional state is released through ownership rather than a fallible cleanup subsystem.
 
 ### 22.2 Validation Or Final-Preflight Error
 
@@ -1902,13 +1893,13 @@ Typical conflicts are missing sources, changed source kind, occupied destination
 
 The executor stops immediately, reports the system error, and runs no later operation. Completed-node effects update the in-memory namespace model deterministically; failed and unstarted initiating-View intent is abandoned; the initiating View is re-rendered from that model; filesystem refresh remains best effort.
 
-A refresh error is reported through Neovim without blocking a later apply or creating a special state. FRED does not claim that the desired batch completed when an execution node failed.
+A refresh error is reported through Neovim without blocking a later current-buffer write or creating a special state. FRED does not claim that the desired batch completed when an execution node failed.
 
 ### 22.5 Instance, Layout, Or Attach Error
 
 Invalid names, roots, layouts, action contexts, keymaps, or lifecycle transitions fail explicitly. An `on_attach` error is fail-fast: FRED stops later callbacks, tears down the partially created windows/buffer/View/timers/RootSession references, marks the instance Destroyed, and rethrows the original error.
 
-A layout-open failure rolls back only resources created by that open attempt. If the instance had no prior buffer/View and buffer initialization cannot complete, it is destroyed; an already valid instance remains usable when an additional window fails to open.
+A layout-open failure rolls back only resources created by that open attempt. If the instance had no prior buffer/View and buffer initialization cannot complete, it is destroyed; an already valid instance remains usable when an additional window fails to open. Unknown cleanup groups fail during `new()` before buffer/View creation. Writes fail explicitly unless the registered Instance buffer is current, Open, displayed, and targeted at its own URI. `instance:refresh()` requires Open/displayed but not current; `:FredRefresh` additionally requires the registered buffer to be current. Hidden instances reject both refresh forms and must be reopened.
 
 ### 22.6 Presentation Error
 
@@ -1946,10 +1937,8 @@ Immediate public-method validation errors and a different SortSpec on a dirty Vi
 - protected-row predecessor/successor anchoring, deterministic fallback, relative-order preservation, and no duplicate EntryId;
 - column registry validation, virtual-text rendering, fixed-width alignment, metadata placeholders, and metadata-only refresh;
 - column and Lua SortSpec metadata requirements fetching only the required stat fields;
-- shared-cleanup candidate protection for current snapshots, live dirty edit bases, active tasks, watcher coverage, diagnostics, pending intent, and precise reveal coverage;
-- cleanup age, memory, and entry-count thresholds, including independent `0` disables and `interval_ms = 0` with nonzero event-driven thresholds;
-- `max_cached_entries` counting only scan-cache namespace rows while metadata, provisional batches, and snapshots contribute only to the memory estimate;
-- object-class eviction priority with least-recently-used ordering inside each class;
+- RootSession Weak-registry behavior, View/task strong ownership, last-View cancellation, and natural final release of snapshots, metadata/cache state, and watchers;
+- cancelled or obsolete generations releasing provisional state promptly through ownership without a Rust retention policy;
 - metadata-generation cancellation and MetadataBatch rejection for stale-generation/current-source-revision and current-generation/stale-source-revision cases after column, Lua SortSpec, path, and namespace-revision changes;
 - renderer reconciliation consuming already-ordered IDs without owning Lua comparator or classification behavior;
 - same-instance navigation rebasing complete paths to the new current root and rejecting dirty View navigation;
@@ -1970,6 +1959,8 @@ Immediate public-method validation errors and a different SortSpec on a dirty Vi
 - visibility state and SortSpec proposals rolling back when validation, callback execution, or boolean-return validation fails;
 - same-value hidden visibility and identical normalized SortSpec calls remaining no-ops;
 - child construction snapshotting parent current presentation values, applying explicit overrides, and remaining independent of later parent changes;
+- `cleanup.instance` inheritance and overrides, setup-only immutable group definitions, unknown-group rejection, Hidden-only LRU membership, newest reinsertion, oldest-first capacity eviction, `capacity = 0`, `delay_ms = 0`, and timer/LRU convergence on one idempotent destroy path;
+- deferred post-write projection tokens validating Instance/View generations, terminal destroy discarding pending projection state, and stale synchronizer callbacks remaining no-ops;
 - direct instance root defaulting to cwd and child root defaulting to the parent's current root.
 
 ### 23.3 Integration Tests
@@ -1982,7 +1973,7 @@ Immediate public-method validation errors and a different SortSpec on a dirty Vi
 - end-to-end hidden-directory subtree projection and fixed SortSpec ordering across Rust catalog delivery, Lua presentation, and Rust reconciliation;
 - sealed atomic ordered-ID submission rejecting stale tokens and duplicate or unknown IDs without partial rendering, while accepting any unique frame-ID subset;
 - partial scan limits while unrelated known intents remain applicable;
-- watcher establishment failure while direct apply checks remain usable;
+- watcher establishment failure while direct plan probes and final-preflight checks remain usable;
 - ignore, Lua hidden-file filtering, Lua sorting, depth, expansion, collapse, scan cancellation, scan failure, scan limits, and watcher gaps never generating deletion;
 - ordinary file and directory CREATE, MOVE, DELETE, COPY, and REPLACE;
 - focused `:FredNew file` and `:FredNew dir` behavior;
@@ -2011,13 +2002,14 @@ Immediate public-method validation errors and a different SortSpec on a dirty Vi
 - process restart performing an ordinary scan of partial results;
 - column changes while Views are clean and dirty without changing editable lines or intent;
 - metadata refresh after size, permission, or timestamp changes;
-- shared cleanup after instance destruction, View navigation, scan cancellation, and watcher coverage release;
-- memory and count pressure following object-class priority and least-recently-used ordering within each class;
-- entry-count pressure ignoring metadata records, provisional batches, and snapshots;
+- RootSession Weak registry entries not retaining sessions after View/task release;
+- last-View detach cancelling root work with no consumers and active tasks delaying final RootSession release until completion/cancellation;
+- per-generation scan limits and bounded provisional batches without asserting a cumulative cache bound for a long-lived RootSession that visits disjoint scopes;
+- final View/task release dropping the whole RootSession and all cache retained from previously visited scopes;
+- the Rust/Lua boundary exposing no Instance cleanup timer, group, capacity, LRU, idle-age, memory-estimate, entry-count, pruning, or sweeper policy to Rust;
 - exact virtual-column fixture without `/NNN` or `../`, with raw buffer lines containing only paths;
 - stale metadata events after cancellation, column changes, SortSpec changes, entry moves, and snapshot publication, including independent stale-generation/current-source-revision and current-generation/stale-source-revision fixtures;
 - stale presentation-generation cancellation across visibility, SortSpec, clean/dirty regime, and superseding-transition changes;
-- `interval_ms = 0` preserving event-driven memory/count enforcement;
 - dirty hidden-file reprojection using frozen full-catalog order, deterministic new-ID fallback, protected-row deduplication/anchors, and omission remaining non-deletion;
 - exact reveal through ignored or uncovered and hidden ancestor chains, fact acquisition before classification, persistent hidden-file visibility, history reset, normal expansion state, and no reveal pin;
 - child creation snapshotting the parent's current hidden-file visibility and SortSpec into the child's immutable initial configuration;
@@ -2030,26 +2022,27 @@ Immediate public-method validation errors and a different SortSpec on a dirty Vi
 - `require("fred").build()` availability;
 - setup, direct-instance, and child-instance configuration validation, including exact complete SortSpecs with wholesale replacement, hidden-file callbacks, runtime getters, Created-state setters, and current-presentation child inheritance;
 - real-buffer hidden-directory subtree propagation plus primary-direction and ascending-tie-break SortSpec behavior;
-- command registration plus function-valued mode-grouped keymaps with `false` removal and no action strings;
+- command registration plus function-valued mode-grouped keymaps with `false` removal, no action strings, and no public apply/save command, action, Instance method, or default mapping;
 - focused `:FredNew file` and `:FredNew dir` commands;
 - one Instance owning one buffer/View while multiple instances and windows share one RootSession safely;
 - immutable edit-base snapshots in dirty Views;
 - process-global mutation lock across same, unrelated, and nested roots;
-- successful and failed `:FredLink` paths both releasing the global lock, invalidating and refreshing overlapping RootSessions when namespace may have changed, and allowing a later apply or `:FredLink`;
+- successful and failed `:FredLink` paths both releasing the global lock, invalidating and refreshing overlapping RootSessions when namespace may have changed, and allowing a later current-buffer write or `:FredLink`;
 - different depth and expansion settings per View;
 - union watcher coverage across Views;
 - unconditional watcher establishment attempts, degraded establishment failure, and manual refresh;
 - watcher-driven clean refresh and dirty namespace rebase;
 - overlapping RootSession invalidation after mutation;
-- `buftype=acwrite` full `:write`, `:update`, and `:wq` behavior, including a `BufWriteCmd` outcome table, deferred capture-suppressed projection, and execution failure that leaves `:wq` open after synchronizing a clean model;
-- rejection of alternate-file, ranged, and append writes;
+- `buftype=acwrite` current-buffer full `:write`, `:update`, and `:wq` behavior for one visible Open Instance only, including current-buffer/registration/display validation, exact FRED-URI target validation, a `BufWriteCmd` outcome table, deferred capture-suppressed projection, and execution failure that leaves `:wq` open after synchronizing a clean model;
+- buffer-local `FileWriteCmd` and `FileAppendCmd` always rejecting ranged and append writes before ordinary file I/O without entering planning, plus `BufWriteCmd` rejection of alternate targets, non-current buffers, Hidden Instances, and mismatched registration, with one write never processing other loaded instances;
+- successful `:wq` followed by immediate Hidden cleanup, including `capacity = 0`, discarding its generation-tagged pending projection so the deferred synchronizer is a no-op without recreating the destroyed Instance/View;
 - valid non-empty plans requiring one confirmation;
 - invalid/conflicted planning results opening non-confirmable diagnostics and preserving edits;
 - empty plan reprojection and modified-state clearing;
 - preview cancellation preserving edits;
 - final-preflight failure leaving Apply and releasing the global lock while preserving dirty state;
-- undo and redo before apply;
-- undo baseline reset after successful apply and execution-failure model re-render;
+- undo and redo before writing the current Open buffer;
+- undo baseline reset after successful write-driven execution and execution-failure model re-render;
 - dirty `set_hidden_files_visible()`/`toggle_hidden_files()` capture, frozen-order membership change, protected-row reconciliation, history reset after every actual boolean change, preserved intent, and same-value no-op;
 - clean sort state change with history reset only on real-row reorder, dirty changed-SortSpec exception, dirty identical-SortSpec no-op, and absence of any deferred requested sort;
 - cursor and identity preservation after refresh;
@@ -2063,7 +2056,7 @@ Immediate public-method validation errors and a different SortSpec on a dirty Vi
 - bounded/cancellable Lua hidden classification and sorting making observable event-loop progress, and stale presentation generations never committing after supersession;
 - worker notification through entry-count- or time-bounded `AsyncHandle` queue batches that re-wake while events remain;
 - virtual columns not changing buffer text, changedtick, undo history, or path parsing;
-- configuring every built-in column and rejecting invalid column, hidden-file, SortSpec, and cleanup setup values;
+- configuring every built-in column and rejecting invalid column, hidden-file, SortSpec, cleanup delay/group/capacity, unknown-group, and setup-only-group override values;
 - clean metadata sort reordering with history reset, dirty metadata virtual-column refresh without real-line movement, and current-sort reapplication on becoming clean;
 - aligned placeholders and display-cell widths for narrow and wide icon glyphs;
 - `fred.new()` setup merge, `instance:new()` current-presentation snapshot plus parent-option inheritance, immutable resolved config, runtime presentation getters, and no duplicate setup attach callbacks;
@@ -2076,8 +2069,9 @@ Immediate public-method validation errors and a different SortSpec on a dirty Vi
 - `toggle()` hiding every current-tab display including floats while leaving other tabs untouched, or opening when none exist;
 - default directory action creating a child instance and transferring the triggering window without custom history;
 - Created/Open/Hidden transitions derived by reconciliation triggered by `WinNew`, `BufWinEnter`, `WinEnter`, deferred `WinClosed`, and `BufHidden`, with validated `BufDelete`/`BufWipeout` entering terminal Destroyed directly;
-- instance `delay_ms` cancellation on redisplay, `0` disablement, and terminal destruction after zero-window delay;
-- hidden dirty buffers remaining available for later apply before expiry, then discarding text/intent without filesystem mutation on destruction;
+- Hidden-instance timer cancellation on redisplay, `delay_ms = 0` disabling only the timer, group-LRU newest reinsertion on rehide, oldest-first overflow eviction, `capacity = 0`, and timer/LRU races sharing one idempotent terminal path;
+- hidden dirty buffers remaining available for a later write after reopening, then discarding text/intent without filesystem mutation when either cleanup trigger destroys them;
+- Hidden `instance:refresh()`/`:FredRefresh` rejection, `instance:refresh()` succeeding for any reopened Open/displayed Instance even when non-current, and `:FredRefresh` remaining current-buffer-only;
 - fixed `filetype=fred`, complete `vim.b[bufnr].fred` before FileType autocmds, and live instance lookup by buffer;
 - keymap installation before FileType, then setup attach callbacks, then instance callbacks;
 - `on_attach` function/list normalization, one execution per buffer, and fail-fast rollback/destruction;
@@ -2112,13 +2106,12 @@ Randomly generated snapshots and intents must preserve:
 - completed execution-node results deterministically produce the same in-memory namespace model;
 - shared coverage equals the union of attached View requirements;
 - dirty View rebase always retains its immutable edit base until rebase completes;
-- metadata columns, sorting, and cleanup never change filesystem intent;
-- cleanup never evicts a snapshot or cache entry still reachable from a protected View/session state;
-- setting any cleanup threshold to `0` disables that threshold without disabling mandatory reference cleanup.
-- destroying one instance cannot release shared objects referenced by another instance;
+- metadata columns, sorting, Instance cleanup, and RootSession ownership release never change filesystem intent;
+- a Weak registry reference never keeps a RootSession alive, while every View/task strong reference does;
+- destroying one instance cannot release RootSession objects referenced by another instance or active task;
 - a live Instance maps to at most one buffer/View even when arbitrarily many windows display it;
-- instance cleanup cannot run while any window displays its buffer;
-- an unapplied View can disappear only through explicit or timed instance destruction, and that disappearance produces no filesystem operation.
+- no Hidden-instance cleanup trigger can destroy an Instance while any window displays its buffer;
+- an unwritten View can disappear only through explicit destruction, external buffer wipeout, hidden-delay expiry, or hidden-group eviction, and that disappearance produces no filesystem operation.
 
 ## 24. Performance Requirements
 
@@ -2131,13 +2124,13 @@ Randomly generated snapshots and intents must preserve:
 - Atomic ordered-ID submissions are one-shot and sealed-token-bound; a stale presentation generation cancels work before submission and cannot mutate the buffer.
 - Re-rendering preserves cursor by EntryId when possible.
 - Multiple Views share snapshot and watcher data rather than rescanning one canonical root independently.
-- Memory use scales linearly with covered entries, Lua's per-View catalog mirrors/classification caches, retained edit-base snapshots, and visited directories.
-- Snapshot versions are released when no dirty View references them.
+- Per-generation scan work and each Lua View catalog scale linearly with that request's covered entries, while a still-live RootSession cache may scale with scopes visited across many generations rather than only current View coverage.
+- Obsolete snapshot versions are released when no View or active task strongly references them; the current snapshot drops with its RootSession.
 - Stat metadata is fetched only for columns and Lua SortSpecs that require it; metadata-only refresh must not trigger unnecessary namespace planning.
 - Metadata sorting may reorder only clean Views; dirty Views freeze real-line order while virtual columns continue to refresh, then reapply the already-current sort when clean.
-- Cleanup is bounded and runs outside the Neovim rendering critical path; memory/count pressure follows the documented object-class priority and uses least-recently-used ordering within each class.
+- RootSession provisional task-owned state is released promptly on cancellation; `max_entries`/`max_directories` and bounded channels/batches constrain each requested generation, not cumulative cache retained by a still-live RootSession.
 - Instance window bookkeeping is proportional to actual displays and does not duplicate scan/snapshot data.
-- Instance cleanup uses one timer only while undisplayed; redisplay cancels it without polling keyboard activity.
+- Lua Instance cleanup uses at most one timer per Hidden Instance plus O(1) group-LRU membership updates; redisplay cancels/removes them without polling keyboard activity, and capacity overflow evicts oldest Hidden instances.
 - native Lua layout work remains outside scan event draining and the Rust filesystem critical path.
 - Version one uses no Tokio runtime and no speculative thread pool.
 
@@ -2159,14 +2152,14 @@ The implementation sequence within those milestones is:
 
 1. Establish the Cargo workspace, initial Neovim 0.12.4/`nvim-oxi` candidate, `nvim_adapter` compatibility spike, Linux/Windows build paths, local build helper, native loader, and headless Neovim harness.
 2. Implement Lua configuration capture, direct/child Instance inheritance including current-presentation snapshots, immutable resolved options, runtime presentation getters/setters, registry/name lookup, function-valued actions/keymaps, `vim.b.fred`, FileType ordering, attach callbacks, and native layout ownership records.
-3. Implement InstanceId/ViewId native registration, one-buffer-per-instance lifecycle, authoritative window reconciliation, open/hide/toggle/window transfer, instance timers, and terminal destroy/discard semantics.
+3. Implement InstanceId/ViewId native registration, one-buffer-per-instance lifecycle, authoritative window reconciliation, open/hide/toggle/window transfer, inherited `cleanup.instance`, setup-only immutable groups, Hidden timers/group LRUs with capacity enforcement, and one idempotent terminal destroy/discard path.
 4. Implement canonical path algebra, reversible filename encoding, immutable Snapshot, RootSession/View state, runtime registry, and read-only flat rendering.
 5. Implement the Rust worker channel, bounded provisional and main-thread event batches, cancellation, generation checks, `AsyncHandle` notification with re-wake, and one atomic snapshot publication after every requested scope in a generation is terminal.
-6. Add baseline depth, local expansion/collapse, reference-counted coverage, ignore rules, Rust EntryFact catalog frames and sealed renderer commits, Lua `presentation` hidden-file filtering/subtree propagation/sorting, metadata columns, conditional stat fetching, presentation history resets, reveal/navigation, watcher establishment/degraded reporting, and shared cleanup.
+6. Add baseline depth, local expansion/collapse, reference-counted coverage, ignore rules, Rust EntryFact catalog frames and sealed renderer commits, Lua `presentation` hidden-file filtering/subtree propagation/sorting, metadata columns, conditional stat fetching, presentation history resets, reveal/navigation, watcher establishment/degraded reporting, and RootSession Weak-registry/View-task ownership release.
 7. Add immutable dirty-View edit bases, namespace-only three-way rebase, overlapping RootSession invalidation, and conflict diagnostics.
 8. Add full-line range EntryId extmarks, Neovim 0.12 buffer-local `p`/`P` wrappers, `:FredNew`, edit capture, same-RootSession provenance normalization and `gp`, and directory-row descendant hiding.
 9. Implement immutable direct namespace probes including planned-parent chains, the pure planner with both revision tokens, COPY_TREE/DELETE_TREE, nested directory normalization, descendant evacuation, self-subtree rejection, replacement validation, collision checks, and cross-filesystem MOVE expansion.
-10. Build synchronous `acwrite`/`BufWriteCmd` integration, write-form rejection, non-confirmable diagnostics, confirmation for valid plans, stale-plan checks, and repeated direct probes in final preflight.
+10. Build synchronous current-buffer `acwrite`/`BufWriteCmd` integration as the sole buffer-planned mutation entry, enforce Open/displayed/current-instance and exact-target-URI validation and one-Instance scope, add non-planning buffer-local `FileWriteCmd`/`FileAppendCmd` rejection handlers, generation-validate deferred post-write synchronization, and add non-confirmable diagnostics, confirmation for valid plans, stale-plan checks, and repeated direct probes in final preflight.
 11. Implement the process-global mutation lock, common post-lock finalization, deterministic model updates, serial fail-stop execution, deep platform tree operations, no-replace destinations, rename-cycle names, overlap refresh, and partial-failure reporting.
 12. Add immediate `:FredLink`, buffer-directory path resolution, and global-lock integration.
 13. Run complete instance-lifecycle, configuration, layout, FileType, action, reveal/navigation, mutation, failure-injection, multi-view, overlap, Linux/Windows, watcher, and large-tree suites before declaring version one stable.
@@ -2178,16 +2171,16 @@ Each phase must preserve read-only usability before mutation support is enabled.
 Version one is ready when:
 
 1. FRED builds locally as a required Rust `cdylib` and loads on Linux and Windows for every exact allowlisted Neovim 0.12 patch-version and pinned `nvim-oxi` revision pair; every direct `nvim_adapter` call passes the pair's compatibility harness, and missing native libraries produce actionable hard errors without a fallback runtime.
-2. The Lua facade exposes `build`, `setup`, `new`, the explicit hidden-file visibility and sort getters/setters, registry lookups, and function-valued `actions`, with no compatibility aliases for superseded hidden-file interfaces; setup validates complete presentation configuration and commands remain convenience wrappers.
+2. The Lua facade exposes `build`, `setup`, `new`, the explicit hidden-file visibility and sort getters/setters, Open/displayed `refresh` that does not require the Instance buffer to be current, registry lookups, and function-valued `actions`, with no public apply/save method, command, action, default mapping, or compatibility aliases for superseded interfaces; `:FredRefresh` remains current-buffer-only and setup validates complete presentation and cleanup configuration.
 3. `:Fred` creates an unnamed instance and opens a responsive flat `filetype=fred`, `buftype=acwrite` View of a local root.
 4. Multiple Views of one canonical root share immutable snapshots while retaining independent Lua presentation state, Rust projection reconciliation, and intent.
 5. A scan generation publishes exactly one immutable current snapshot only after all requested scopes are terminal; partial and failed scopes remain non-authoritative in that result.
 6. Dirty Views retain immutable edit-base snapshots across external namespace changes.
 7. Ignore, hidden-file display, sort, depth, expansion, collapse, scan cancellation, scan failure, scan limits, reveal, layout, and watcher gaps never imply deletion.
-8. Watcher establishment is automatic; establishment failure produces a degraded warning without globally blocking unrelated valid apply operations.
+8. Watcher establishment is automatic; establishment failure produces a degraded warning without globally blocking unrelated valid write-driven plans.
 9. Configured metadata columns render as aligned virtual text without changing editable path lines; FRED displays no `/NNN` ID prefix or `../` row, and built-in icon, permission, size, and timestamp columns handle unavailable metadata with placeholders.
 10. Column and Lua SortSpec requirements are fetched as the union of attached View requirements; a MetadataBatch with either a stale metadata generation or a mismatched source root revision is rejected independently, metadata-only changes never create namespace conflicts or deletion intent, and metadata sorting cannot reorder a dirty View's real lines.
-11. Shared cache state is released by reference ownership and bounded shared policy; instance `delay_ms` independently destroys only undisplayed instances, and every numeric `0` disables only its documented condition.
+11. The RootSession registry retains Weak references while Views and active tasks retain strong references; last-View detach cancels root work with no consumers, provisional task-owned batches release promptly on cancellation, and final View/task release naturally drops the whole RootSession plus all snapshots, metadata/cache state, and watchers. Scan limits bound each requested generation but acceptance imposes no cumulative memory bound on a still-live RootSession and adds no Rust cleanup, pruning, sweeper, LRU, threshold, or eviction policy.
 12. External namespace changes refresh clean Views and rebase dirty Views within covered scope.
 13. Same-named files in different directories retain distinct EntryIds.
 14. Ordinary edits and `:FredNew file`/`:FredNew dir` create, move, rename, replace, and delete files and directories from final desired state.
@@ -2200,18 +2193,18 @@ Version one is ready when:
 21. Directory MOVE emits one parent move plus only explicitly required descendant operations in conditional dependency order.
 22. Immutable planner probes and repeated final-preflight probes reject missing sources, wrong source kinds, occupied destinations, required parents neither existing nor created by the plan, unrelated planned-parent occupants, non-directory existing parents or nearest ancestors, and parent traversal through symlinks; a planned occupant vacates before replacement parent creation, which precedes every descendant installation.
 23. Destination collision never overwrites, including a destination that appears after final preflight.
-24. Invalid or conflicted planning results open non-confirmable diagnostics and preserve dirty edits; only valid non-empty plans open one all-or-nothing confirmation preview; an empty valid plan clears modified state without preview.
+24. Only the buffer-local `BufWriteCmd` handler for an ordinary full-buffer write of the current visible Open FRED buffer enters buffer planning, and one write processes only that Instance. It rejects any target filename different from the FRED buffer URI; buffer-local `FileWriteCmd` and `FileAppendCmd` handlers always reject ranged and append writes before ordinary file I/O and never enter planning. Non-current, mismatched, or Hidden writes also fail before planning. Invalid or conflicted plans open non-confirmable diagnostics and preserve dirty edits; only valid non-empty plans open one all-or-nothing confirmation preview; an empty valid plan clears modified state without preview.
 25. Every plan carries distinct edit-base and planned-root revisions, and stale revision, changedtick, or intent-generation checks abort before mutation.
 26. Every post-lock outcome leaves Apply, processes queued refresh demand, and releases the process-global mutation lock.
-27. The global lock prevents concurrent apply or `:FredLink` across same, unrelated, and overlapping roots.
+27. The global lock prevents concurrent write-driven apply pipelines or `:FredLink` across same, unrelated, and overlapping roots.
 28. Cross-filesystem file and directory MOVE executes as copy to the final destination followed by source deletion only after copy success.
 29. The executor stops on the first execution error and runs no later operation.
 30. Completed-node results update the in-memory namespace model deterministically; partial execution reports completed, failed, and unstarted operations, abandons failed/unstarted initiating-View intent, and re-renders from that model.
-31. Filesystem refresh remains best effort; refresh failure reports through Neovim without adding a special state or blocking a later apply.
+31. Filesystem refresh remains best effort; refresh failure reports through Neovim without adding a special state or blocking a later current-buffer write.
 32. Successful and partially failed mutation invalidates and refreshes overlapping RootSessions on a best-effort basis.
 33. File content, permissions, size, and timestamp changes do not create FRED namespace conflicts.
 34. External rename is handled conservatively without inode/file-key identity inference.
-35. `:FredLink {from} {to}` executes immediately with buffer-directory relative resolution and exclusive destination creation; every success or failure releases the global lock, namespace-changing outcomes invalidate and refresh overlapping RootSessions on a best-effort basis before release, and a later apply or `:FredLink` can proceed.
+35. `:FredLink {from} {to}` executes immediately with buffer-directory relative resolution and exclusive destination creation; every success or failure releases the global lock, namespace-changing outcomes invalidate and refresh overlapping RootSessions on a best-effort basis before release, and a later current-buffer write or `:FredLink` can proceed.
 36. All Rust unit, Lua unit, integration, property, and headless Neovim tests pass.
 37. FRED runs without Oil installed and contains no Oil runtime dependency.
 38. A direct instance resolves setup options plus explicit options; a child defaults to the parent's current root, snapshots the parent's current hidden-file visibility and SortSpec into its immutable initial configuration, applies child overrides, and does not duplicate setup callbacks or retain a live link to later parent changes.
@@ -2221,8 +2214,8 @@ Version one is ready when:
 42. Borrowed windows restore prior/alternate/scratch buffers, owned displays close when safe, and FRED never deletes the final ordinary window merely to hide itself.
 43. `hide()` targets the current or explicit window, no public `close()`/hide-all exists, and `toggle()` hides all current-tab displays including floats or opens when none exist.
 44. Default directory selection creates a child instance, transfers the triggering window, preserves normal Neovim history behavior, and leaves the parent buffer available until instance cleanup.
-45. Instance lifecycle derives Created/Open/Hidden display state through authoritative window reconciliation, defers `WinClosed` reconciliation, sends validated `BufDelete`/`BufWipeout` directly to terminal Destroyed, cancels cleanup while any valid window displays the buffer, and treats `delay_ms = 0` as disabled.
-46. A hidden dirty buffer may be reopened and applied; terminal instance destruction discards unapplied text/intent and releases references without executing a filesystem operation.
+45. Instance lifecycle derives Created/Open/Hidden display state through authoritative window reconciliation, defers `WinClosed` reconciliation, sends validated `BufDelete`/`BufWipeout` directly to one idempotent terminal Destroyed path, and makes Lua-owned Hidden delay plus setup-defined group capacity the only OR-combined automatic destroy triggers. `Open -> Hidden` inserts newest and starts the timer when enabled; `Hidden -> Open` removes/cancels; rehide reinserts newest; overflow destroys oldest until within capacity; `capacity = 0` retains none; `delay_ms = 0` disables only the timer.
+46. A Hidden dirty buffer cannot enter the write/apply pipeline or refresh but may be reopened and then written/refreshed; `instance:refresh()` accepts any Open/displayed Instance even when non-current, while `:FredRefresh` remains current-buffer-only. Terminal Instance destruction discards unwritten text/intent, detaches its View, and releases references without executing a filesystem operation. If successful `:wq` hides the buffer and cleanup destroys it before deferred synchronization, destroy discards the generation-tagged pending projection and the synchronizer is a no-op, with no recovery or pending-destroy state. Direct and child instances inherit resolved `cleanup.instance` values, unknown groups fail during `new()`, and setup-only groups are immutable.
 47. Keymaps merge by mode/lhs, accept only functions or `false`, and built-in/custom actions share explicit `action(ctx, opts?)` context.
 48. `actions.select()` dispatches entry kinds to action functions; the default opens files normally and directories in inherited child instances.
 49. `vim.b[bufnr].fred` is complete before fixed `filetype=fred` autocmds, and users can retrieve live instances by InstanceId, name, or buffer.
@@ -2249,7 +2242,8 @@ Version one is ready when:
 - Other compiling platforms may expose unhandled platform-specific behavior until concrete reports arrive.
 - OS watcher behavior and limits differ; degraded watcher coverage must remain visible.
 - Very large repositories may require users to narrow baseline depth, local expansion, or ignore rules.
-- Retained immutable snapshots increase memory use while dirty Views remain open; soft memory limits cannot evict state that remains referenced.
+- Retained immutable snapshots increase memory use while dirty Views or active tasks hold strong references; version one relies on ordinary ownership release rather than a separate memory-budget eviction policy.
+- A long-lived RootSession may cumulatively retain namespace and metadata cache for scopes visited by earlier generations even after current View coverage moves elsewhere. Per-generation scan limits do not bound that total; all retained cache is guaranteed to release only when the final View/task references release the whole RootSession.
 - Metadata columns and metadata-backed Lua sorting add stat calls and platform-specific normalization cost, especially for large covered roots.
 - Lua mirrors each View's bounded entry catalog and classification cache, increasing main-thread work, memory use, and garbage-collection pressure at large coverage limits.
 - A slow or failing `is_hidden_file` callback can delay or abort a presentation transaction; its exception is intentionally exposed directly by Neovim.
@@ -2258,7 +2252,7 @@ Version one is ready when:
 - Extmark and provenance behavior under complex edits requires headless and property testing.
 - `nvim-oxi` couples the native build to the exact Neovim 0.12 patch-version/revision pairs listed in build configuration; every new pair requires an explicit `nvim_adapter` compatibility run and may require a rebuild.
 - Opening many windows for one instance increases Neovim window/UI cost even though scan and snapshot data remain shared.
-- Hidden dirty instances may be destroyed after `cleanup.instance.delay_ms`; unapplied edits are intentionally lost at that point.
+- Hidden dirty instances may be destroyed by either `cleanup.instance.delay_ms` or their cleanup group's capacity overflow; unwritten edits are intentionally lost at that point, and `capacity = 0` makes hiding immediately terminal.
 - Native jumplist/alternate-buffer behavior depends on normal Neovim window buffer switching and is not supplemented by a Fred history stack.
 - User `on_attach`, keymap, hidden-file, and custom action callbacks execute inside Neovim and may fail or introduce user-side latency.
 
