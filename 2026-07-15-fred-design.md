@@ -12,9 +12,9 @@ FRED is a buffer-native file browser for Neovim. It projects selected parts of a
 
 FRED is independent. It does not depend on, integrate with, or call Oil. It may borrow general ideas such as editable directory buffers, entry identity, asynchronous rendering, operation planning, and confirmation before mutation, but it owns its scanner, snapshots, views, planner, executor, watcher integration, and user interface.
 
-FRED uses a required Rust `cdylib` built locally by the user or plugin manager. The filesystem core is Rust-first and uses `nvim-oxi` for snapshots, identity, scanning, intent, planning, execution, and keyed Neovim buffer reconciliation. Lua owns the stable Instance facade, resolved configuration, actions, keymaps, attach callbacks, registry lookup, native Neovim layouts, lifecycle autocmds, Instance cleanup timers and hidden-group LRUs, and presentation policy: it filters hidden files and sorts the bounded catalog supplied by Rust, then submits only an ordered visible EntryId sequence for Rust to render. Rust RootSession lifetime follows ordinary strong/weak ownership rather than policy-driven retention or eviction. FRED supports only explicitly validated Neovim 0.12 patch-version and pinned `nvim-oxi` revision pairs. It does not publish precompiled binaries or provide a pure-Lua fallback.
+FRED uses a required Rust `cdylib` built locally by the user or plugin manager. The filesystem core is Rust-first and uses `nvim-oxi` for native module integration, immutable namespace snapshots, session-scoped `NodeId` identity, scanning, metadata, intent, conflict handling, planning, and execution. Rust never reads or writes a FRED View buffer and does not know whether Lua presents a flat or tree UI. Rust combines each RootSession snapshot with per-View intent into a projection-neutral, tree-shaped `ViewSemanticFrame`. Lua owns the stable Instance facade, resolved configuration, actions, keymaps, attach callbacks, registry lookup, native Neovim layouts, lifecycle autocmds, Instance cleanup timers and hidden-group LRUs, materialization and presentation state, sibling-local sorting, the common projector, the buffer projection engine, range extmarks, metadata decorations, cursor/undo behavior, yank/put provenance, and bidirectional projection codecs. Version one ships only the internal flat codec. Rust RootSession lifetime follows ordinary strong/weak ownership rather than policy-driven retention or eviction. FRED supports only explicitly validated Neovim 0.12 patch-version and pinned `nvim-oxi` revision pairs. It does not publish precompiled binaries or provide a pure-Lua fallback.
 
-The view is a flat list of complete root-relative paths. It is not an indented tree, sidebar, or connector-glyph hierarchy. A view may materialize different directories to different depths while every displayed line remains a complete path.
+The version-one renderer is a flat list of complete View-relative paths. It is not an indented tree, sidebar, or connector-glyph hierarchy. A View may materialize different directories to different depths while every displayed line remains a complete path. This is a Lua rendering contract rather than a Rust namespace limitation: Rust supplies the same `ViewSemanticFrame` and parent/child membership that a future built-in tree codec would consume. Version one exposes no tree mode, projection toggle, placeholder `view_mode`, public custom renderer, or projection-backend registration API.
 
 Example buffer for `/home/user/project`:
 
@@ -42,10 +42,10 @@ FRED must:
 4. Support sorting, hidden-file controls, ignore rules, bounded scanning, and partial views.
 5. Let ordinary text edits express file and directory creation, rename, move, copy, replacement, and deletion, with the user's ordinary write of the current visible Open FRED buffer as the sole buffer-planned mutation entrypoint.
 6. Capture copy provenance from ordinary Vim yank and put operations where Neovim exposes or FRED wraps the operation.
-7. Track entry identity independently of its current path.
+7. Track every existing or pending namespace node with one opaque RootSession-scoped `NodeId`, independently of its current path or lifecycle state.
 8. Treat directory copy, move, and deletion as single logical tree operations rather than per-descendant plans.
 9. Prevent hidden, ignored, unscanned, collapsed, or depth-excluded entries from being interpreted as deletions.
-10. Share immutable filesystem snapshots and watcher coverage between multiple views of the same canonical root while preserving per-view intent and projection state.
+10. Share immutable filesystem snapshots and watcher coverage between exact-root Views and explicit parent/child/navigate lineage Views in one RootSession while preserving per-View root, intent, expansion, and presentation state.
 11. Detect external namespace changes and update attached views automatically within materialized coverage.
 12. Reject invalid paths, missing sources, wrong source kinds, required parents that neither exist nor are created by the same plan, and occupied destinations before mutation.
 13. Never silently overwrite an existing destination.
@@ -56,18 +56,19 @@ FRED must:
 18. Remain responsive while scanning, copying, and rendering large directory sets.
 19. Expose a stable Lua Instance lifecycle with explicit actions, buffer metadata, attach callbacks, and layout-independent display control.
 20. Build from source for validated Neovim and `nvim-oxi` combinations.
-21. Render optional metadata columns such as icons, permissions, size, and timestamps without changing editable path syntax.
+21. Let Lua render optional metadata columns such as icons, permissions, size, and timestamps without changing editable path syntax or exposing any buffer-layout concept to Rust.
 22. Release the whole RootSession and its snapshots, metadata/cache state, watcher coverage, and provisional work naturally through strong-reference ownership; scan limits bound each requested generation but do not promise a cumulative memory bound for a still-live RootSession.
 23. Let one instance own one editable buffer while displaying that buffer in multiple windows and sharing RootSession data by reference.
 24. Let users create named or unnamed instances, inherit configuration, choose action functions per keymap mode, and reveal files through normal flat expansion.
 25. Destroy Hidden instances through exactly two Lua-owned, OR-combined triggers: their per-instance hidden delay and their setup-defined cleanup-group LRU capacity, while discarding only unapplied buffer state and never mutating the filesystem.
+26. Keep the Rust/Lua data path projection-neutral: Rust publishes semantic nodes and parent/child membership, Lua produces one common depth-first `ProjectedRow` sequence, and only the internal Lua codec determines editable line syntax.
 
 ## 3. Non-Goals For Version One
 
 Version one will not:
 
 - depend on or interoperate with Oil;
-- provide an indented tree, connector glyphs, or a permanent sidebar layout;
+- ship an indented-tree renderer, flat/tree toggle, connector-glyph hierarchy, permanent sidebar layout, placeholder projection-mode option, or public custom projection codec;
 - recursively follow directory symlinks;
 - support SSH, S3, archives, containers, or other remote backends;
 - expose a public backend registration interface;
@@ -127,11 +128,11 @@ There is no public Instance apply/save method, apply action, apply command, or d
 
 An entry absent from the current buffer because of ignore rules, Lua hidden-file filtering, Lua sorting, baseline depth, local collapse, scan limits, scan cancellation, scan failure, or missing watcher coverage remains part of filesystem state.
 
-Lua submits only a generation-bound ordered sequence of visible EntryIds. Rust validates that sequence and treats every omitted catalog EntryId as projection absence, never as deletion intent. Only user removal of a bound identity from the editable projection generates delete intent. Rust independently preserves dirty intent, conflict, and validation-error rows while reconciling the ordinary browse order. Metadata columns are projection-only: a missing, stale, or failed metadata value cannot create, remove, rename, or delete intent.
+After Lua synchronously renders a `ViewSemanticFrame`, it commits the frame token, ordered visible `NodeId` sequence, and resulting changedtick. Rust validates frame currency, membership, and uniqueness and records a `CommittedProjection`. A node omitted from the current frame or projection because of ignore rules, hidden-file filtering, materialization, collapse, scan status, or presentation policy remains projection absence. Only an existing NodeId that belonged to the initiating `CommittedProjection` and is absent from Lua's later semantic capture can generate removal intent. Dirty, pending, conflict, and validation state is already applied by Rust when it builds the next `ViewSemanticFrame`; Lua does not infer filesystem deletion from catalog omission. Metadata columns are projection-only: a missing, stale, or failed metadata value cannot create, remove, rename, or delete intent.
 
 ### 5.3 Path Is Not Identity
 
-Every scanned entry receives an opaque `EntryId` scoped to its shared RootSession snapshot lineage. The ID does not derive from the displayed path, inode, or platform file key. Editing a path changes an entry's desired location but not its identity.
+Every namespace node receives one opaque `NodeId` scoped to its RootSession. Existing files, directories, symlinks, pending creates, and pending copy destinations all use the same identity type; lifecycle state is separate from identity. The ID does not derive from the displayed path, inode, or platform file key. Editing or FRED-moving a path changes location without changing NodeId. A pending node that is successfully created becomes an existing snapshot node without changing NodeId. External rename remains conservative delete-plus-create because FRED does not infer identity from inode or platform file keys.
 
 ### 5.4 Direct Namespace Checks Authorize Operations
 
@@ -194,7 +195,7 @@ FRED supports only exact Neovim 0.12 compatibility pairs listed in the build con
 - one exact Neovim 0.12 patch version;
 - one pinned `nvim-oxi` revision using its `neovim-0-12` feature.
 
-The build helper accepts only a listed pair and rejects every unlisted patch/revision combination rather than guessing a feature selection. Neovim 0.11 and earlier, nightly builds, and unlisted 0.12 patches are unsupported. The first candidate is Neovim 0.12.4, but it becomes a supported pair only after the FRED compatibility harness validates every direct Neovim call used by the internal `nvim_adapter`, including buffer access, range extmarks, inline virtual text, changedtick access, and main-thread notification.
+The build helper accepts only a listed pair and rejects every unlisted patch/revision combination rather than guessing a feature selection. Neovim 0.11 and earlier, nightly builds, and unlisted 0.12 patches are unsupported. The first candidate is Neovim 0.12.4, but it becomes a supported pair only after the FRED compatibility harness validates every direct native integration call used for module registration, argument/result conversion, `AsyncHandle` wakeups, and main-thread event delivery. Buffer access, range extmarks, virtual text, changedtick, cursor, and undo operations are Lua responsibilities and are tested through the headless Neovim harness rather than Rust native-bridge calls.
 
 FRED actively supports and tests:
 
@@ -220,16 +221,15 @@ The helper detects the exact running Neovim patch version, selects its listed pi
 
 Upgrading Neovim or the pinned `nvim-oxi` revision may require rebuilding FRED. The Lua facade may load far enough to expose `build()` and an actionable diagnostic, but `fred.new()` fails when the required compatible native library is missing or cannot load. There is no degraded pure-Lua browse mode or precompiled-binary fallback.
 
-### 6.3 Rust-First Runtime
+### 6.3 Projection-Neutral Rust Core And Lua Buffer Runtime
 
 Rust owns:
 
-- canonical paths, immutable snapshots, RootSession, View, identity, provenance, intent, conflict, and validation state;
-- scanning, metadata collection, watching, coverage, planning, execution, refresh, and ordinary strong-reference ownership of RootSession state;
-- bounded catalog batches for every entry in the View-requested scopes, including entries that Lua may classify as hidden;
-- generation/revision-bound one-shot order validation and keyed buffer, range-extmark, virtual-text, cursor, and dirty-row reconciliation;
-- buffer parsing, direct namespace probes, and the process-global mutation gate through one internal `nvim_adapter` for every direct Neovim call;
-- worker tasks, generation checks, and main-thread notification.
+- canonical native and encoded paths, the RootSession-scoped `NodeId` allocator, immutable `RootSnapshot` values, normalized parent/child membership, metadata observations, watcher state, and coverage accounting;
+- Rust Views identified by `ViewId`, each with a movable `root_node_id`, immutable edit base, semantic `ViewIntent`, conflict/validation state, and `CommittedProjection`;
+- application of `ViewIntent` to a snapshot to produce a projection-neutral, tree-shaped `ViewSemanticFrame` containing clean, dirty, pending, moved, conflict, and validation nodes;
+- scanning, metadata collection, watching, direct namespace probes, planning, execution, deterministic model updates, overlap invalidation, and the process-global mutation gate;
+- bounded frame events, worker tasks, generation checks, and main-thread event notification.
 
 Lua owns:
 
@@ -237,11 +237,12 @@ Lua owns:
 - `setup()` configuration capture and direct/child instance inheritance;
 - the public Instance object and live-instance registry lookups;
 - action functions, mode-grouped buffer-local keymaps, FileType metadata, and `on_attach`;
-- native Neovim layout construction, window ownership, open/hide/toggle/focus behavior, highlight definitions, Neovim lifecycle autocmds, and all Instance cleanup timers/group LRUs;
-- per-instance presentation state and the current View catalog mirror;
-- `is_hidden_file` evaluation, hidden-directory subtree propagation, stable single-key sorting, and submission of ordered visible EntryIds.
+- native Neovim layout construction, window ownership, open/hide/toggle/focus behavior, highlight definitions, lifecycle autocmds, and all Instance cleanup timers/group LRUs;
+- per-Instance materialization and expansion state, per-View catalog mirrors, hidden-file classification, sibling-local sorting, depth-first traversal, columns, and the common projector;
+- the internal `ProjectionCodec` boundary, with only `FlatProjectionCodec` implemented in version one;
+- every FRED buffer operation: line rendering and capture, full-line range extmarks, virtual text, cursor reconciliation, changedtick reads, `'modified'`, undo-baseline resets, internal-sync suppression, `TextYankPost`, `p`/`P` wrappers, and register-qualified provenance.
 
-The boundary passes opaque InstanceId/ViewId handles, bounded generation-tagged EntryFacts, validated presentation values, a sealed `CatalogFrameToken`, atomic ordered-EntryId submissions, buffer/window identifiers, and explicit operation results. Lua submits either one `{ token, ordered_visible_ids }` value or nothing; it never submits rendered text, extmark positions, metadata decorations, or filesystem intent. Rust validates exact token currency, EntryId membership, uniqueness, and transaction atomicity. Any unique subset of the frame's EntryIds is a valid projection, so Rust does not claim to detect a semantically mistaken Lua omission. Rust remains authoritative for identity, planning, deletion intent, protected dirty rows, and rendering. Lua does not reimplement filesystem planning, and Rust does not execute user callback tables. Rust modules outside `nvim_adapter` do not call `nvim_oxi::api` directly; this keeps the exact-patch compatibility surface explicit and testable.
+The forward boundary passes opaque RootSession/View/Node handles and bounded generation-tagged `ViewSemanticFrame` events. Lua builds one ordered `ProjectedRow` sequence, synchronously renders it, and submits a `ProjectionCommitRequest { frame_token, ordered_node_ids, changedtick }`. The reverse boundary passes `CaptureRequest { projection_revision, changedtick, semantic_rows }`, where each row contains NodeId, desired View-relative path candidate, kind, and optional same-session `copy_from`. Rust validates token currency, NodeId membership and uniqueness, path legality, provenance, and semantic intent; it never parses line syntax or receives extmark positions, indentation, connectors, cursor positions, or rendered text. Lua never creates filesystem operations, and Rust never executes user callbacks or directly reads or writes a FRED View buffer.
 
 ### 6.4 Background Work And Task State
 
@@ -369,7 +370,7 @@ The current presentation values become part of the child's immutable constructio
 
 The resolved configuration is immutable after `new()`. `instance:config()` returns a read-only construction snapshot; `instance:hidden_files_visible()` and `instance:sort()` return read-only copies of committed runtime presentation state. Runtime changes use explicit methods such as `set_columns`, `set_hidden_files_visible`, `set_sort`, `navigate`, and per-call `open({ layout = ... })`; FRED does not expose a generic `set_config()` or `update_config()`.
 
-In Created state, presentation setters only validate and update Lua PresentationState. There is no View or catalog yet, so they perform no intent capture, metadata request, ordered-ID submission, buffer synchronization, or history reset. `open()` creates the View from those values. Open and lifecycle-Hidden instances use the transaction rules in Section 13. Destroyed instances reject presentation operations through the ordinary lifecycle guard. `instance:refresh()` is separate: it accepts any Open Instance with at least one valid display, even when its buffer is not current. `:FredRefresh` is current-buffer-only and validates that the current buffer belongs to a visible Open FRED Instance.
+In Created state, presentation setters only validate and update Lua PresentationState. There is no View or semantic frame yet, so they perform no intent capture, metadata request, projection, buffer synchronization, or history reset. `open()` creates the View from those values. Open and lifecycle-Hidden instances use the transaction rules in Section 13. Destroyed instances reject presentation operations through the ordinary lifecycle guard. `instance:refresh()` is separate: it accepts any Open Instance with at least one valid display, even when its buffer is not current. `:FredRefresh` is current-buffer-only and validates that the current buffer belongs to a visible Open FRED Instance.
 
 ### 7.2 Instance, Buffer, Window, And Lifecycle Model
 
@@ -388,7 +389,7 @@ Instance
   cleanup group and optional Hidden-LRU membership
 ```
 
-Multiple instances may point at the same canonical root. They own distinct buffers, Views, intent, undo history, columns, expansion state, and Lua presentation state while sharing the root's immutable snapshots, scan cache, metadata cache, and watcher coverage through RootSession references.
+Multiple instances may share a RootSession in two cases: exact canonical-root reuse and explicit parent/child/navigate lineage within that session's namespace. They own distinct buffers, Views, intent, undo history, columns, expansion state, and Lua presentation state while sharing immutable snapshots, NodeIds, scan cache, metadata cache, and watcher coverage. An independent direct `fred.new()` reuses only an exact-root RootSession; it does not automatically adopt an existing ancestor session or dynamically merge overlapping sessions.
 
 The public lifecycle states are:
 
@@ -419,7 +420,7 @@ buffer delete or wipeout      -> Destroyed
 destroy()                     -> Destroyed
 ```
 
-Fred uses `WinNew`, `BufWinEnter`, `WinEnter`, `WinClosed`, and `BufHidden` as display-reconciliation triggers; event-local counters are not authoritative. Reconciliation derives displays from valid windows that actually contain the instance buffer. Because `WinClosed` fires before the closing window disappears from window queries, its reconciliation is deferred to the next main-loop turn. A validated `BufDelete` or `BufWipeout` for the instance's current buffer bypasses display reconciliation and invokes the terminal destroy path directly.
+FRED uses `WinNew`, `BufWinEnter`, `WinEnter`, `WinClosed`, and `BufHidden` as display-reconciliation triggers; event-local counters are not authoritative. Reconciliation derives displays from valid windows that actually contain the instance buffer. Because `WinClosed` fires before the closing window disappears from window queries, its reconciliation is deferred to the next main-loop turn. A validated `BufDelete` or `BufWipeout` for the instance's current buffer bypasses display reconciliation and invokes the terminal destroy path directly.
 
 Instance cleanup is configured with inherited per-instance values and setup-only groups:
 
@@ -441,7 +442,7 @@ cleanup = {
 
 On `Open -> Hidden`, Lua inserts the Instance as newest in its group's LRU, starts its timer only when `delay_ms > 0`, and immediately enforces capacity by destroying oldest Hidden members until within the group's limit. `capacity = 0` therefore retains no Hidden instances. On `Hidden -> Open`, Lua removes the Instance from the LRU and cancels its timer. Rehiding starts a fresh one-shot timer and reinserts it as newest. Timer expiry and LRU eviction both call one idempotent terminal destroy path, so races between them are harmless. No other automatic destroy trigger exists.
 
-Unapplied buffer edits and intent are discarded without mutating the filesystem. FRED does not prompt, auto-write, or block navigation merely because the old instance buffer is modified: the user may return to that buffer and write it before destruction, or allow cleanup to discard the edits. A forced external buffer deletion has the same discard semantics. This is not filesystem undo or recovery: text that was never successfully written simply ceases to exist with the destroyed buffer.
+Unapplied buffer edits and intent are discarded without mutating the filesystem. FRED does not prompt, auto-write, or block child-instance window transfer or hiding merely because the old instance buffer is modified: the user may return to that buffer and write it before destruction, or allow cleanup to discard the edits. Same-instance `navigate()` still requires a clean View as specified in Section 7.8. A forced external buffer deletion has the same discard semantics. This is not filesystem undo or recovery: text that was never successfully written simply ceases to exist with the destroyed buffer.
 
 Destroy detaches the View from its RootSession. The registry's Weak reference does not keep the RootSession alive; other Views and active tasks do. Last-View detach cancels work with no consumers, and final task release naturally drops the RootSession and all Rust-owned snapshots, metadata/cache state, and watchers.
 
@@ -507,7 +508,7 @@ otherwise: open(opts), using opts.layout or the instance default
 
 This internal multi-window hide is specific to `toggle`; other tabpages are unaffected and no public hide-all API is added.
 
-The default directory-selection action creates a child instance, creates its buffer, and transfers the triggering Fred window to that child buffer instead of stacking another float or split. The parent loses that window, becomes Hidden if no other window displays it, enters its cleanup-group LRU as newest, and starts its timer when enabled. Window buffer replacement uses normal Neovim behavior; FRED does not maintain a separate back/forward history or override native buffer, alternate-buffer, or jumplist behavior.
+The default directory-selection action creates a child instance, creates its buffer, and transfers the triggering FRED window to that child buffer instead of stacking another float or split. When the selected directory belongs to the parent's RootSession, the child shares that RootSession and its NodeIds, uses the selected directory NodeId as `root_node_id`, and snapshots only the parent's expansion entries inside that subtree; later parent and child expansion changes are independent. The parent loses that window, becomes Hidden if no other window displays it, enters its cleanup-group LRU as newest, and starts its timer when enabled. Window buffer replacement uses normal Neovim behavior; FRED does not maintain a separate back/forward history or override native buffer, alternate-buffer, or jumplist behavior.
 
 ### 7.4 Filetype And Buffer Metadata
 
@@ -586,7 +587,7 @@ Attach callbacks are fail-fast. The first callback error stops later callbacks, 
 
 ### 7.6 Buffer Syntax And Canonical Path Encoding
 
-Each editable line contains exactly one encoded root-relative path.
+Version one's internal `FlatProjectionCodec` encodes each editable line as exactly one canonical path relative to the current View root. Rust never parses this syntax: Lua's buffer projection engine decodes edited lines into semantic rows containing NodeId, desired path candidate, kind, and optional provenance, and Rust repeats canonical path validation before updating View intent.
 
 ```text
 README.md
@@ -619,7 +620,7 @@ FRED does not indent entries or draw connector glyphs. Directories and descendan
 
 FRED borrows the useful shape of Oil's column registry and column specifications, while keeping its own flat path-list model. The reference implementation is Oil's [`columns.lua`](https://github.com/stevearc/oil.nvim/blob/b73018b75affd13fa38e2fc94ef753b465f770d7/lua/oil/columns.lua) and [`oil-columns` documentation](https://github.com/stevearc/oil.nvim/blob/b73018b75affd13fa38e2fc94ef753b465f770d7/doc/oil.txt#L412-L494). FRED does not copy Oil runtime code or depend on Oil.
 
-The editable buffer line remains exactly one encoded root-relative path. Columns are rendered as Neovim extmark virtual text at byte column zero with `virt_text_pos = "inline"`; they are not inserted into the buffer line, are not parsed by the planner, and cannot be mistaken for a path component. The path is always the final visible field. EntryId remains an extmark and is never rendered as editable text.
+The editable buffer line remains exactly one encoded View-relative path. Lua renders columns as Neovim extmark virtual text at byte column zero with `virt_text_pos = "inline"`; they are not inserted into the buffer line, are not returned by the codec as path text, and cannot be mistaken for a path component. The path is always the final visible field. NodeId remains in a Lua-owned full-line range-extmark binding and is never rendered as editable text.
 
 The initial built-in columns are:
 
@@ -659,13 +660,13 @@ The actual buffer text remains:
 2026-07-15-fred-design.md
 ```
 
-FRED displays neither Oil's concealed `/NNN` internal-ID prefix nor a `../` parent row. EntryId stays in an extmark, and the View root is intentionally not represented by a row.
+FRED displays neither Oil's concealed `/NNN` internal-ID prefix nor a `../` parent row. NodeId stays in a Lua-owned extmark binding, and the View root NodeId is intentionally not represented by a row.
 
 A string selects defaults. A table uses the first element as the column name and may set `width`, `align` (`"left"`, `"center"`, or `"right"`), `format` for time columns, `highlight`, `separator`, and column-specific icon options. The path column is implicit and cannot be removed.
 
 The default separator is one display cell. Default minimum display widths are two cells for `icon`, nine for `permissions`, eight for `size`, nine for `type`, and the formatted display width for each timestamp. Missing values use `-` and the same padding/alignment as present values. `width` is a minimum measured with Neovim display width, not byte length; a wider value expands that column for the whole projection rather than being truncated. All rows in one projection therefore use the same stable boundaries. This follows Oil's projection-wide width/alignment pass in [`view.lua`](https://github.com/stevearc/oil.nvim/blob/b73018b75affd13fa38e2fc94ef753b465f770d7/lua/oil/view.lua#L650-L818), adapted to virtual text rather than editable prefix text.
 
-The internal Rust definition is intentionally small:
+The internal Lua definition is intentionally small:
 
 ```text
 ColumnDefinition {
@@ -673,17 +674,17 @@ ColumnDefinition {
   required_metadata
   default_width
   default_alignment
-  render(entry, metadata, column_options) -> highlighted text chunks
+  render(view_node, metadata, column_options) -> highlighted text chunks
 }
 ```
 
-Version one registers only built-in columns; it does not expose a public custom-column or backend registration API. Unlike Oil, FRED column definitions do not parse mutable column text because only the path exists in the buffer syntax.
+Version one registers only built-in Lua columns; it does not expose a public custom-column, renderer, projection-codec, or backend registration API. Column definitions do not parse mutable path text. Rust only collects the metadata fields requested by attached Views and returns normalized values in semantic frame nodes.
 
 Each column definition declares the metadata it needs. `icon` and `type` use already-known entry kind; `permissions`, `size`, and time columns request stat metadata. Lua's current SortSpec separately declares the one sort field it needs. A RootSession requests the union of metadata fields required by attached View columns and Lua presentation states, just as coverage is the union of their directory scopes. This follows Oil's on-demand `require_stat` approach in [`files.lua`](https://github.com/stevearc/oil.nvim/blob/b73018b75affd13fa38e2fc94ef753b465f770d7/lua/oil/adapters/files.lua#L50-L225). Metadata failures render a placeholder and a non-blocking status rather than making a namespace scan authoritative or failed. Refreshing metadata may re-render clean and dirty Views, but changes to permissions, size, or timestamps never create FRED namespace conflicts.
 
 Changing columns only reprojects the View and requests any missing metadata. It never changes dirty state, edit-base revisions, or filesystem intent. Lua sorting may use `path`, `type`, `size`, `mtime`, `ctime`, `atime`, or `birthtime`; unavailable metadata always sorts after available values and does not block apply.
 
-A metadata revision may cause Lua to submit a new order only for a clean View. A dirty View updates cached metadata values and virtual columns but retains its frozen full-catalog order. When it becomes clean after apply, successful empty-plan synchronization, or ordinary undo removes its intent, Lua recomputes from current metadata and the already-current SortSpec; no deferred requested sort exists. A SortSpec or metadata change that actually changes real-row order clears Neovim undo history and establishes a new baseline. If real-row order is unchanged, presentation state may still advance but history is not cleared.
+A metadata revision may cause Lua to rebuild and commit a new ProjectedRow order only for a clean View. A dirty View updates cached metadata values and virtual columns but retains its frozen sibling-local traversal order. When it becomes clean after apply, successful empty-plan synchronization, or ordinary undo removes its intent, Lua recomputes from current metadata and the already-current SortSpec; no deferred requested sort exists. A SortSpec or metadata change that actually changes real-row order clears Neovim undo history and establishes a new baseline. If real-row order is unchanged, presentation state may still advance but history is not cleared.
 
 ### 7.7 Actions, Keymaps, And Commands
 
@@ -767,7 +768,7 @@ Commands remain convenience entry points over instances and actions. There is no
 
 ```text
 :Fred [root]                 create an unnamed instance and open it
-:FredRefresh                 refresh the current visible Open Fred instance
+:FredRefresh                 refresh the current visible Open FRED instance
 :FredDepth {n|all}           change baseline recursion depth
 :FredExpand [depth]          expand the current directory
 :FredCollapse                collapse the current directory
@@ -780,7 +781,7 @@ There is no general temporary filter command. Hidden-file visibility is handled 
 
 ### 7.8 Expansion, Reveal, And Navigation
 
-A View has a configurable baseline depth plus ordinary local directory expansions. The projection remains a flat list of complete paths relative to the instance's `current_root`.
+A View has a configurable baseline depth plus ordinary directory expansions. Lua stores expansion depth by RootSession-scoped directory NodeId, not by buffer path or current-root-relative identifier. The version-one projection remains a flat list of complete paths relative to the instance's `current_root`, while the shared NodeId expansion state is independent of the codec.
 
 Example at `/project` with baseline depth `0`:
 
@@ -814,15 +815,15 @@ Reveal performs ordinary View operations only:
 
 1. validate the root-relative target path;
 2. install precise ignore overrides for the target and its ancestor chain;
-3. materialize or request EntryFacts for each required ancestor and the target without first committing the target into the visible projection;
+3. materialize or request semantic node facts for each required ancestor and the target without first committing the target into the visible projection;
 4. classify the ancestor chain and target as those facts arrive;
 5. if any required fact is hidden, commit the same persistent `hidden_files_visible = true` transition as the public setter;
-6. wait for the target EntryId to appear in the committed visible projection;
+6. wait for the target NodeId to appear in the committed visible projection;
 7. move the cursor in the selected instance window.
 
-This order lets reveal traverse ignored or previously uncovered ancestors before hidden classification is possible. A real hidden-file visibility change first captures current intent, reprojects while preserving protected dirty rows, clears Neovim undo history, and establishes a new baseline. Existing unapplied intent remains and keeps `'modified'` set. Reveal does not create a pinned row, temporary reveal mode, or `clear_reveal()` API. Its expansions remain normal View state and users collapse them normally. Enabling hidden-file visibility remains global to the instance and persists until the user toggles it again.
+This order lets reveal traverse ignored or previously uncovered ancestors before hidden classification is possible. A real hidden-file visibility change first captures semantic rows into Rust ViewIntent, obtains a new ViewSemanticFrame containing all dirty/pending/conflict/validation nodes, reprojects it in Lua, clears Neovim undo history, and establishes a new baseline. Existing unapplied intent remains and keeps `'modified'` set. Reveal does not create a pinned row, temporary reveal mode, or `clear_reveal()` API. Its expansions remain normal NodeId-keyed View state and users collapse them normally. Enabling hidden-file visibility remains global to the instance and persists until the user toggles it again.
 
-`navigate(relative_directory)` is an explicit alternative to creating a child instance. It changes `current_root` while preserving InstanceId, buffer, windows, resolved config, keymaps, attach effects, columns, current hidden-file visibility, and current SortSpec. It invalidates the old View generation, releases the old RootSession reference, attaches the new RootSession, resets local expansion/projection/cursor identity, updates `vim.b[bufnr].fred.root`, re-renders paths relative to the new root, and establishes a new undo baseline. FileType and `on_attach` do not run again.
+`navigate(relative_directory)` is an explicit alternative to creating a child instance. The target must resolve to a real directory NodeId inside the current RootSession; a directory symlink is a leaf and cannot be expanded or used as same-session inline navigation. Navigation changes the View's `root_node_id` while preserving InstanceId, RootSession, NodeIds, buffer, windows, resolved config, keymaps, attach effects, columns, current hidden-file visibility, current SortSpec, and NodeId-keyed expansion state. It invalidates the old View generation, updates `current_root` and `vim.b[bufnr].fred.root` from the selected node's canonical location, re-bases View-relative paths, commits a new projection, and establishes a new undo baseline. FileType and `on_attach` do not run again.
 
 For example, navigating from `/project` into `src/` transforms:
 
@@ -840,7 +841,7 @@ init.lua
 lib/
 ```
 
-`navigate` is not another expansion operation. Because one instance owns one buffer, direct same-instance navigation requires a clean View; the default directory action creates a new instance instead, allowing the old dirty buffer to remain available for a later current-buffer write until either Hidden cleanup trigger destroys it.
+`navigate` is not another expansion operation. Because one instance owns one buffer, direct same-instance navigation requires a clean View. Expansion NodeIds that still occur under the new root remain active automatically; expansion entries outside it remain harmless instance-local state and become active again if a later same-session root includes them. The default directory action creates a child instance instead, snapshots the parent's expansion entries inside the selected subtree, and leaves the old dirty parent buffer available for a later current-buffer write until either Hidden cleanup trigger destroys it. Opening a directory outside the current session, including a resolved directory-symlink target, creates or reuses an exact-root RootSession rather than aliasing target children beneath the symlink node.
 
 ### 7.9 Write Semantics
 
@@ -857,7 +858,7 @@ Before planning, the `BufWriteCmd` handler validates all of the following:
 
 An alternate target filename is rejected rather than treated as an export. A Hidden Instance cannot enter the write/apply pipeline or refresh. The user must reopen it, making it Open and displayed, before `:write`, `instance:refresh()`, or `:FredRefresh` is accepted; only the write and `:FredRefresh` additionally require that buffer to be current.
 
-The Lua `BufWriteCmd` handler starts the internal confirmation/apply pipeline and does not return to the write command until that attempt reaches a terminal result. It may pump the Neovim event loop while Rust workers run, but the pipeline does not mutate buffer lines while the callback is active. One deferred post-write View synchronizer owns reprojection, edit-capture suppression, `'modified'`, and the new undo baseline. Every pending projection is tagged with the initiating Instance and View identities and generations.
+The Lua `BufWriteCmd` handler asks the active `ProjectionCodec` and buffer projection engine to capture semantic rows, then submits their NodeIds, desired View-relative path candidates, kinds, provenance, projection revision, and changedtick to Rust before planning. It does not return to the write command until that attempt reaches a terminal result. It may pump the Neovim event loop while Rust workers run, but the pipeline does not mutate buffer lines while the callback is active. One deferred Lua post-write synchronizer owns frame consumption, reprojection, edit-capture suppression, `'modified'`, and the new undo baseline. Every pending projection is tagged with the initiating Instance and View identities and generations.
 
 Write outcomes are explicit:
 
@@ -878,7 +879,7 @@ Rules:
 - destroying an instance discards unwritten buffer text and intent without filesystem mutation;
 - FRED does not export its path list through ordinary write syntax.
 
-Hidden-file visibility changes are presentation synchronizations, not writes. A setter that supplies the already-committed boolean is a no-op. Every actual boolean change captures current intent and, after Rust reconciles the atomic ordered-ID submission, clears Neovim undo history and establishes a new baseline even when visible real-row membership/order happens to remain unchanged. Existing intent and `'modified'` survive. An identical normalized SortSpec is also a no-op. A different SortSpec updates presentation state, but clears history only when its committed result actually changes real-row order.
+Hidden-file visibility changes are presentation synchronizations, not writes. A setter that supplies the already-committed boolean is a no-op. Every actual boolean change captures semantic rows into Rust ViewIntent and, after Lua renders and Rust accepts the resulting ProjectionCommitRequest, clears Neovim undo history and establishes a new baseline even when visible real-row membership/order happens to remain unchanged. Existing intent and `'modified'` survive. An identical normalized SortSpec is also a no-op. A different SortSpec updates presentation state, but clears history only when its committed sibling-local traversal actually changes real-row order.
 
 Normal Vim editing remains the primary interface for create, rename, move, copy, replacement, and delete; writing the current Open FRED buffer is the only way those edits enter planning and execution.
 
@@ -931,7 +932,7 @@ When a directory row is removed:
 
 - unedited descendants under that directory are implicitly included in DELETE_TREE;
 - those descendants are hidden on the next buffer synchronization so the View does not display paths that will not exist in the desired state;
-- descendants explicitly moved outside the deleted subtree are pinned and evacuated before DELETE_TREE;
+- descendants explicitly moved outside the deleted subtree remain explicit ViewSemanticFrame nodes and are evacuated before DELETE_TREE;
 - undoing the directory-row removal restores its descendant projection;
 - filesystem mutation still waits for confirmed write.
 
@@ -943,7 +944,7 @@ Extmarks track positions through supported buffer edits but do not travel throug
 
 - FRED installs buffer-local `p` and `P` wrappers because Neovim 0.12 does not expose `TextPutPre` or `TextPutPost`;
 - the wrappers execute normal put behavior, preserving the chosen register, count, direction, undo behavior, and cursor semantics, then record the inserted range;
-- `TextYankPost` stores provenance for the affected register as its register name, text and register type snapshot, `RootSessionId`, and source EntryIds;
+- Lua `TextYankPost` stores provenance for the affected register as its register name, text and register type snapshot, `RootSessionId`, and source NodeIds;
 - a wrapper attaches provenance only when the register actually used still has the recorded text and type and belongs to the same RootSession; a mismatch invalidates that register's provenance;
 - provenance is valid only in the same RootSession; wrappers do not attach foreign-session provenance;
 - insertions not observed with valid same-session provenance are ordinary unbound CREATE declarations, even if their text matches an existing row.
@@ -978,7 +979,7 @@ All copies precede source deletion. The same rule applies to directory sources u
 
 ### 8.6 Paste Into Directory
 
-`:FredPasteInto`, mapped to `gp`, copies the most recent FRED-aware yank into the directory under the cursor. The yank must belong to the current View's RootSession; a parent- or child-instance yank from a different RootSession produces an explicit error. Users can expand directories in the same flat View when source and destination must share provenance.
+`:FredPasteInto`, mapped to `gp`, copies the most recent FRED-aware yank into the directory under the cursor. The yank must belong to the current View's RootSession. Parent/child Views that explicitly share that RootSession may exchange provenance; an independent exact-root or overlapping RootSession produces an explicit error. Users can expand directories in the same flat View when source and destination must share provenance.
 
 Example:
 
@@ -1047,7 +1048,7 @@ COPY or COPY_TREE source -> final destination
 DELETE or DELETE_TREE source
 ```
 
-Source deletion runs only after the copy operation reports success. If source deletion fails, both source and destination may remain. FRED stops and reports the partial result.
+Source deletion runs only after the copy operation reports success. If both copy and source deletion succeed, the source NodeId moves to the final destination. If copy succeeds but source deletion fails, both namespace entries remain: the source retains its NodeId and the destination receives a new NodeId because one identity cannot represent two actual entries. If COPY_TREE itself fails and leaves a partial destination, later refresh discovers that partial tree with new NodeIds rather than transferring source identities. FRED stops and reports the partial result.
 
 A directory cannot be moved to itself or into its own descendant.
 
@@ -1098,197 +1099,418 @@ Rename swaps, cycles, and case-only renames may use unique internal same-directo
 
 ## 10. Shared RootSession And Per-View State
 
-### 10.1 Immutable Snapshots
+### 10.1 Identity And Path Types
 
-A published filesystem snapshot is immutable and carries a monotonically increasing revision. A scan generation builds one candidate snapshot plus provisional rendering batches without mutating `current_snapshot`.
+The native model uses three opaque identity domains:
 
-Provisional batches and individual scopes may render as they arrive, but a generation publishes exactly one new immutable `current_snapshot` only after every requested scope reaches a terminal complete, partial, or failed result. Partial and failed scopes remain explicitly non-authoritative inside that single published result. Late or cancelled generations cannot publish, and provisional data never updates a View's edit base.
+```text
+RootSessionId  identifies one namespace session
+ViewId         identifies one semantic/edit View
+NodeId         identifies one existing or pending namespace node inside a RootSession
+```
 
-Published snapshots remain alive while referenced by Views or active tasks and are released when the last strong reference disappears. Namespace snapshots contain identity, path, kind, coverage authority, and scan status; optional permission, size, and timestamp observations live in a separate RootSession metadata cache with its own monotonically increasing `metadata_revision`. Metadata enrichment may re-render columns without advancing `root_revision` or any View edit base. Cancelled or superseded work releases provisional state promptly through ordinary ownership.
+`NodeId` is the only node-identity type. Files, directories, symlinks, pending creates, pending copy destinations, dirty moved nodes, and conflicted nodes do not use parallel identity types. Lifecycle state is separate from identity. The complete scope is conceptually `(RootSessionId, NodeId)`, although the serialized opaque NodeId may carry its session namespace so Lua handles one value.
 
-### 10.2 RootSession
+Revision and generation types remain distinct:
 
-All Views of the same canonical root share one Rust RootSession:
+```text
+RootRevision
+MetadataRevision
+ScanGeneration
+CoverageGeneration
+IntentGeneration
+FrameSequence
+ProjectionRevision
+ChangedTick
+```
+
+Rust distinguishes:
+
+```text
+SessionRelativePath  relative to RootSession.session_root
+ViewRelativePath     relative to View.root_node_id
+RelativePathCandidate submitted by Lua before Rust validation
+EntryName            one canonical encoded path component
+```
+
+Rust validates and converts every Lua path candidate. Lua never authorizes native path joining or root escape.
+
+### 10.2 Immutable RootSnapshot And Node Lifetime
+
+A published filesystem snapshot is immutable and carries a monotonically increasing revision. The RootSession root is itself a directory NodeId but is never rendered as an ordinary row.
+
+```text
+NodeObservation = Confirmed
+                | RetainedUnverified { source_revision, reason }
+
+SnapshotNode {
+  id: NodeId
+  parent_id: optional NodeId   -- none only for the session root
+  name: EntryName
+  session_relative_path: SessionRelativePath
+  kind: file | directory | symlink | other
+  symlink_info: optional SymlinkInfo
+  observation: NodeObservation
+}
+
+RootSnapshot {
+  root_session_id: RootSessionId
+  revision: RootRevision
+  root_node_id: NodeId
+  nodes_by_id: Map<NodeId, SnapshotNode>
+  children_by_parent: Map<NodeId, Arc<[NodeId]>>
+  node_id_by_session_path: Map<SessionRelativePath, NodeId>
+  directory_status: Map<NodeId, Complete | Partial | Failed>
+}
+```
+
+`children_by_parent` is normalized namespace membership, not a View's sort order. A Snapshot builder creates the node table, parent index, child membership, and path index together and publishes only a self-consistent immutable value. Every non-root node has exactly one directory parent, every child list agrees with `parent_id`, each path agrees with its parent and name, and symlinks have no child membership even when their targets are directories.
+
+Directory membership is authoritative only when that directory's status is `Complete`. A Complete result replaces the prior direct-child set and may prove that an old child disappeared. A Partial or Failed result merges newly observed children into the prior snapshot but carries forward every previously known unobserved child as `RetainedUnverified`; it never converts non-observation into deletion. Retained nodes remain in path and parent/child indexes and may be displayed with degraded status. A later Complete result, successful execution model update, or authoritative direct probe may confirm or remove them. Initial partial scans cannot invent unknown entries, but entries never committed to a projection cannot be interpreted as deletions.
+
+A scan generation builds one candidate snapshot through bounded internal worker events without mutating `current_snapshot`. Scan progress may be reported while work runs, but candidate nodes do not enter Lua's editable projection. A generation publishes exactly one new immutable `current_snapshot` only after every requested scope reaches a terminal complete, partial, or failed result; only then does Rust build the next ViewSemanticFrame. Late or cancelled generations cannot publish, and candidate data never advances a dirty View's edit base.
+
+NodeId lifetime rules are:
+
+- an unchanged same-path, same-kind node in one snapshot lineage ordinarily retains NodeId;
+- a FRED rename or MOVE retains NodeId while changing path and parent membership;
+- a pending create or provenance destination receives a NodeId before planning; a destination that remains CREATE, COPY, or COPY_TREE after final-state normalization keeps that NodeId after successful creation;
+- when one provenance destination plus source removal normalizes to MOVE, Rust rebinds the destination's semantic identity to the source NodeId and retires the provisional destination NodeId; COPY and COPY_TREE destinations otherwise use their own new NodeIds;
+- external rename is represented conservatively as deletion of the old NodeId plus creation of a new NodeId;
+- same-path, same-kind external replacement may be treated as the previous node because FRED intentionally does not use inode or platform file keys;
+- successful same-filesystem MOVE and fully successful cross-filesystem MOVE retain the source NodeId at the destination;
+- when a cross-filesystem MOVE copies successfully but source deletion fails, the source retains its NodeId and the now-separate destination receives a new NodeId;
+- a partial failed COPY_TREE destination discovered by refresh receives new NodeIds rather than inheriting source identities.
+
+Published snapshots remain alive while referenced by Views or active tasks. Optional permission, size, and timestamp observations live in a separate metadata snapshot keyed by NodeId plus observed path. Metadata enrichment may re-render Lua columns without advancing RootRevision or a View edit base.
+
+### 10.3 RootSession, Sharing, And Movable View Roots
 
 ```text
 RootSession {
-  canonical_root
-  current_snapshot: Arc<Snapshot>
+  id: RootSessionId
+  session_root: CanonicalRoot
+  current_snapshot: Arc<RootSnapshot>
   root_revision
-  scan_cache
-  metadata_cache
+  metadata_snapshot
   metadata_revision
+  node_id_allocator
+  scan_cache
   scan_generation
   metadata_generation
-  directory_status
   watcher_state
-  coverage_reference_counts
+  coverage_by_view
   metadata_reference_counts
   task_state: Idle | Scan | Apply
 }
 ```
 
-The RootSession does not own a mutation lock. The mutation lock is process-global because different canonical roots can overlap. The runtime registry stores only `Weak<RootSession>` values; attached Views and active scan, metadata, apply, and watcher tasks hold `Arc<RootSession>` strong references. Last-View detach cancels work with no consumers, and the RootSession plus snapshots, metadata/cache state, and watchers drop naturally after tasks release the final strong reference. Rust implements no RootSession cleanup policy, timer, capacity, or LRU.
+The RootSession does not own the process-global mutation lock. The runtime registry stores Weak references for exact canonical session roots; attached Views and active tasks hold strong references.
 
-### 10.3 Instance
+Sharing rules are explicit:
 
-Lua exposes one public Instance object backed by authoritative runtime registration:
+- direct `fred.new({ root = ... })` reuses only an exact-root RootSession;
+- same-instance navigation to a descendant keeps the current RootSession and changes only the View's `root_node_id`;
+- a child Instance opened on a directory inside the parent's session shares the parent RootSession and NodeIds;
+- independent overlapping direct roots are not automatically merged or reparented;
+- a directory outside the current session, including a resolved directory-symlink target, creates or reuses its own exact-root RootSession.
+
+This avoids creation-order-dependent ancestor-session adoption while allowing ordinary descendant navigation and child Instances to preserve NodeIds and expansion state. Separate overlapping RootSessions remain consistent through overlap invalidation after mutation.
+
+Last-View detach cancels work with no consumers. After active tasks release the final strong reference, the RootSession, snapshots, metadata/cache state, coverage bookkeeping, and watchers drop naturally. Rust implements no cleanup timer, capacity, LRU, sweeper, or object-level eviction policy.
+
+### 10.4 Rust View, Intent, And Committed Projection
+
+Rust View state contains no buffer or presentation objects:
 
 ```text
-Instance {
-  instance_id
-  optional unique name
-  optional profile
-  state: Created | Open | Hidden | Destroyed
-  initial_root
-  current_root
-  resolved_config
-  presentation_state
-  bufnr: optional
-  view_id: optional
-  displayed_windows: Map<winid, LayoutHandle>
-  hidden_cleanup_timer: optional
-  cleanup_group
-  hidden_lru_membership: optional
+View {
+  id: ViewId
+  root_session: Arc<RootSession>
+  root_node_id: NodeId
+  root_status: Present | Missing { last_known_session_path }
+  view_generation
+  edit_base: Arc<RootSnapshot>
+  edit_base_revision: RootRevision
+  intent: ViewIntent
+  committed_projection: optional CommittedProjection
+  frame_sequence
 }
 ```
 
-The Instance owns its one buffer/View lifecycle, inherits resolved `cleanup.instance` values, and holds references to whichever RootSession matches `current_root`. Window count is derived from actual windows displaying the buffer, not from keyboard activity. Named and buffer-based registry lookups validate that the live runtime identity still matches rather than trusting reusable names or buffer numbers.
+`root_node_id` is the current namespace root for that View. The FlatProjectionCodec renders paths relative to this node. Changing `root_node_id` inside the same session rebases View-relative paths without reallocating descendant NodeIds.
 
-### 10.4 View And Presentation State
-
-Each FRED buffer has one Rust View plus one Lua presentation state:
+Lua captures the editable buffer into projection-neutral rows:
 
 ```text
-Rust View {
-  root_session_id
-  view_id
-  bufnr
-  view_generation
-  baseline_depth
-  local_expansions
-  explicit_includes
-  columns
-  column_layout
-  projection
-  intent
-  intent_generation
-  dirty_state
-  edit_base: Arc<Snapshot>
-  cursor_identity
-  last_changedtick
+SemanticCaptureRow {
+  node_id: NodeId
+  desired_path: RelativePathCandidate
+  desired_kind
+  copy_from: optional { root_session_id, node_id }
 }
 
-Lua PresentationState {
+CaptureRequest {
+  view_id
+  committed_projection_revision
+  changedtick
+  rows: [SemanticCaptureRow]
+}
+```
+
+When Lua discovers an unbound row, it requests one or more new NodeIds from the Rust View, attaches them to the rows, and then submits the capture. Rust validates projection revision, NodeId scope and uniqueness, existing-kind preservation, pending-node ownership, same-session provenance, canonical path legality, and duplicate destinations. Capture normalization may return `NodeIdRebinding { provisional_destination, source }` only when a unique provenance destination plus removed source becomes MOVE; Lua applies that mapping to row bindings, cursor identity, and NodeId-keyed expansion before consuming the next semantic frame.
+
+Normalized semantic intent is stored as:
+
+```text
+NodeOrigin = Existing
+           | PendingCreate
+           | PendingCopy { copy_from: NodeId }
+
+ViewIntent {
+  generation: IntentGeneration
+  root_node_id: NodeId
+  existing_changes: Map<NodeId, ExistingDesiredChange>
+  removed_existing: Set<NodeId>
+  pending_nodes: Map<NodeId, PendingDesiredNode>
+  validation: Map<NodeId, [ValidationError]>
+  conflicts: Map<NodeId, [NamespaceConflict]>
+}
+```
+
+Rust never stores FlatProjectionCodec text as intent. It stores validated desired View-relative paths anchored to the stable `root_node_id`, kinds, identity, and provenance, and derives canonical session paths from the root node's current location whenever it builds a semantic frame, probes, or plans. Therefore a dirty View's pending creates, copies, and path edits follow a same-session MOVE of its root NodeId while preserving their relative locations. Final-state normalization may replace a unique PendingCopy destination's provisional NodeId with the removed source NodeId when the result is MOVE; CREATE/COPY destinations retain their allocated NodeIds.
+
+After Lua renders a frame, it submits:
+
+```text
+ProjectionCommitRequest {
+  view_id
+  frame_token
+  ordered_node_ids: [NodeId]
+  changedtick
+}
+
+CommittedProjection {
+  revision: ProjectionRevision
+  source_frame
+  ordered_node_ids
+  node_id_set
+  changedtick
+}
+```
+
+The call is synchronous and fail-fast. There is no projection lease, rollback protocol, recovery state, or automatic renderer retry. `CommittedProjection` is the authoritative baseline for distinguishing a user-deleted bound node from a node that never entered the editable projection.
+
+### 10.5 ViewSemanticFrame And Bounded Transport
+
+Rust applies the View's semantic intent to the current snapshot before Lua projection:
+
+```text
+ViewNodeState {
+  origin: Existing | PendingCreate | PendingCopy
+  dirty: boolean
+  validation_errors
+  conflicts
+}
+
+ViewNode {
+  id: NodeId
+  parent_id: optional NodeId
+  view_relative_path: ViewRelativePath
+  name: EntryName
+  kind
+  observation: Confirmed | RetainedUnverified
+  state: ViewNodeState
+  metadata: optional normalized metadata
+}
+
+UnplacedViewNode {
+  id: NodeId
+  path_candidate
+  desired_kind
+  state
+}
+
+ViewFrameToken {
+  root_session_id
+  view_id
+  view_generation
+  root_revision
+  metadata_revision
+  intent_generation
+  frame_sequence
+  sealed_identity
+}
+
+ViewSemanticFrame {
+  token: ViewFrameToken
+  root_node_id: NodeId
+  root_status: Present | Missing { last_known_session_path }
+  nodes_by_id: Map<NodeId, ViewNode>
+  children_by_parent: Map<NodeId, Arc<[NodeId]>>
+  unplaced_nodes
+  directory_status
+}
+```
+
+The frame already reflects existing renames/moves, pending creates and copies, removed nodes, directory-delete descendant suppression, explicitly evacuated descendants, conflict state, and validation state. Lua does not merge a second protected-row model into ordinary browse rows.
+
+Large frames cross the native boundary through bounded events:
+
+```text
+FrameBegin { token, root_node_id, root_status }
+FrameNodeBatch { token, nodes }
+FrameDirectoryBatch { token, parent_id, child_ids, status }
+FrameUnplacedBatch { token, nodes }
+FrameComplete { token }
+FrameCancelled { token }
+```
+
+Lua rejects mixed or stale tokens. Rust child lists represent membership only; each Lua View applies its own sort.
+
+### 10.6 Lua Materialization, Projector, Codec, And Buffer Engine
+
+Each Instance/View owns Lua state:
+
+```text
+ExpansionState {
+  by_node: Map<NodeId, DepthLimit>
+}
+
+MaterializationState {
+  baseline_depth
+  expansions: ExpansionState
+  explicit_includes
+  generation
+}
+
+PresentationState {
   hidden_files_visible
   sort
+  columns
+  materialization
   presentation_generation
-  catalog_by_entry_id
+  catalog_mirror
   hidden_classification_cache
-  last_full_catalog_order
-  frozen_dirty_full_catalog_order: optional
-  next_frame_sequence
+  frozen_dirty_sibling_orders: optional
   proposed_transition: optional
 }
 ```
 
-Rust seals each catalog with an opaque immutable token:
+Expansion is keyed by NodeId. Same-session navigation therefore preserves descendant expansion automatically. A child Instance snapshots the parent's expansion entries inside the selected directory subtree and then evolves independently. A FRED directory MOVE retains expansion because the source NodeId is stable. If a yank/put destination's provisional NodeId normalizes to MOVE, Lua remaps any binding or expansion entry from that provisional ID to the source NodeId. COPY destinations retain their own new NodeIds and do not inherit source expansion by default.
+
+The Lua catalog mirror contains the current frame token, root NodeId/status, nodes by NodeId, child membership, unplaced nodes, directory statuses, and completion state. A Missing root status is a View-level diagnostic and does not cause Lua to replace the existing editable buffer with an empty projection. The common projector:
+
+1. applies hidden-file classification with hidden-directory subtree propagation;
+2. applies the current SortSpec only within each direct sibling list;
+3. applies baseline depth, NodeId-keyed expansions, and explicit includes;
+4. performs depth-first traversal so every materialized directory subtree remains contiguous;
+5. produces one ordered `ProjectedRow` sequence containing NodeId, parent NodeId, depth, View-relative path, name, kind, state, and metadata.
+
+Flat and future tree rendering consume the same ProjectedRow order. Version one implements only an internal sealed codec:
 
 ```text
-CatalogFrameToken {
-  root_session_id
-  view_id
-  view_generation
-  scan_generation
-  root_revision
-  metadata_generation
-  metadata_revision
-  presentation_generation
-  intent_generation
-  changedtick
-  frame_sequence
-  sealed_identity
+ProjectionCodec {
+  encode(ProjectedRows) -> lines, binding specs, decorations
+  decode(buffer lines, NodeId bindings) -> SemanticCaptureRows
 }
+
+FlatProjectionCodec.encode(row) = row.view_relative_path
+FlatProjectionCodec.decode(line) = desired View-relative path candidate
 ```
 
-Every frame-bound field must equal the current authoritative value at commit time. `frame_sequence` increases for each sealed frame of a View, `sealed_identity` makes the token unforgeable and single-use, and a token becomes stale when any bound identity/revision/generation/tick differs. `presentation_generation` advances when an actual hidden-file visibility or SortSpec proposal is accepted for scheduling, when a clean/dirty transition changes the ordering regime, or when a newer proposal supersedes in-flight classification/sorting. The proposal's frames use that new generation; failure may leave committed presentation values unchanged while the generation remains advanced for cancellation safety. Same-value/no-op setters do not advance it. Metadata-only change advances metadata generation/revision rather than presentation generation.
+Version one exposes no projection-mode option, tree codec, toggle, custom renderer, or public codec registration seam.
 
-Rust streams bounded EntryFacts for every entry in the View-requested scopes into Lua's token-bound catalog. Lua either submits one atomic `{ token, ordered_visible_ids }` value or submits nothing. Any unique subset of IDs belonging to that frame is structurally valid projection absence. Rust validates exact token equality, membership, uniqueness, and single-use atomicity; it cannot determine whether Lua accidentally omitted an otherwise visible ordinary ID. Callback failure, non-boolean callback return, cancellation, or supersession aborts before submission, so the previous projection remains committed.
+The Lua `BufferProjectionEngine` owns the buffer number, extmark namespace, current frame token, projection revision, NodeId bindings, internal-sync depth, changedtick, provenance state, line rendering and capture, full-line range extmarks, virtual text, cursor reconciliation, `'modified'`, undo-baseline resets, `TextYankPost`, and `p`/`P` wrappers. Rust does not read or write those objects.
 
-When a clean View becomes dirty, Lua freezes its last full-catalog order, including IDs currently filtered from the visible projection. Metadata may continue to update cached values and virtual columns, but neither metadata nor a newer comparator result changes that frozen order. Dirty hidden-file membership changes take a subsequence or superset of the frozen order. IDs discovered after the freeze are placed after the frozen IDs in deterministic normalized-path, exact-path, then EntryId order until the View becomes clean. On becoming clean, Lua discards the freeze and recomputes the full-catalog order from current metadata and the current SortSpec.
+When a clean View becomes dirty, Lua freezes each currently materialized sibling order rather than one catalog-global order. Metadata may update virtual columns, but no comparator result moves real rows until the View becomes clean. Hidden-file membership changes take filtered subsets or supersets of those frozen sibling orders. Newly discovered nodes use deterministic sibling-local fallback order until clean recomputation.
 
-Rust merges ordinary browse IDs with protected edit, conflict, and validation rows. An ordinary ID already represented by a protected row is removed from the ordinary sequence before merge. Protected rows retain their current relative order and stable predecessor/successor EntryId anchors from the last committed projection. A protected group is placed between surviving anchors when possible, after a surviving predecessor or before a surviving successor when only one remains, and at the end in current protected-row order when neither survives. Reconciliation produces at most one row for each EntryId. Lua never owns edit identity or deletion authority.
-
-A clean View may advance its edit base whenever a new snapshot is published. A dirty View keeps the immutable snapshot against which its current intent was captured.
-
-Two Views over the same root may use different depth, expansion, hidden-file visibility, sort, and column settings and may both contain edits.
-
-### 10.5 Revision And Rebase Behavior
+### 10.7 Revision, Rebase, Lifecycle, And Overlap Behavior
 
 When a new snapshot is published:
 
-- clean Views reproject from it;
-- dirty Views compare their immutable edit base, the new snapshot, and their desired namespace;
-- non-overlapping namespace changes merge automatically;
-- conflicting paths, kinds, identities, or destinations remain visible and block the affected plan;
-- the dirty View advances its edit base only after a successful rebase.
+- clean Views receive a new ViewSemanticFrame derived from it;
+- dirty Views compare their immutable edit base, the new snapshot, and their desired View-relative namespace anchored to `root_node_id`;
+- a same-session MOVE of that root NodeId changes the derived session paths but preserves every desired View-relative path;
+- nodes carried as RetainedUnverified because their parent scope is Partial or Failed are treated as Unknown, not external deletion or kind conflict;
+- non-overlapping authoritative namespace changes merge automatically;
+- conflicting confirmed paths, kinds, identities, or destinations remain frame nodes with conflict state and block the affected plan;
+- the dirty View advances its edit base only after a successful semantic rebase.
 
 File contents, permissions, size, and timestamps are not part of this conflict model.
 
-### 10.6 Instance And View Lifecycle
+Window entry/exit updates Lua Instance display handles and cleanup state without changing Rust View intent. Buffer wipeout, explicit destroy, timer expiration, or LRU eviction enters one idempotent terminal path that invalidates Instance/View generations, discards unwritten buffer text and semantic intent, releases coverage and edit-base references, and detaches the View.
 
-The runtime owns authoritative registries keyed by opaque `instance_id` and `view_id`, with validated secondary lookups by optional unique name and `bufnr`.
+Same-instance `navigate` requires a clean View and a real directory NodeId inside the current RootSession. It keeps InstanceId, ViewId, RootSession, NodeIds, buffer, windows, config, presentation values, and expansion state; changes `root_node_id`; invalidates the old frame/projection generation; updates buffer metadata; re-renders rebased View-relative paths; and establishes a new undo baseline. A directory symlink remains a leaf and cannot be same-session expanded or navigated as though it owned target children.
 
-Window entry/exit updates the Instance's display handles and Lua-owned cleanup state without changing View intent. Hiding or transferring every window leaves the buffer/View alive in Hidden state, inserts the Instance as newest in its configured group LRU, starts its timer when enabled, and enforces group capacity. Reopening removes it from the LRU and cancels the timer. Buffer wipeout, explicit destroy, timer expiration, or LRU eviction enters one idempotent terminal destroy path that invalidates the Instance and View generations, discards unwritten text/intent, releases coverage and edit-base references, cancels instance-owned timers/tasks, removes group membership, and detaches from RootSession. Async events carry instance, root, View, and generation identity rather than trusting reusable window or buffer numbers.
+If another FRED View moves this View's root NodeId inside the same RootSession, NodeId preservation keeps `root_status = Present`; `current_root` follows the node's new canonical path, dirty View-relative intent follows that root, and the next frame re-bases descendants. Rust records `root_status = Missing { last_known_session_path }` only when a successful model update, Complete authoritative parent membership, or direct probe confirms that the root NodeId disappeared; Partial/Failed non-observation retains it as unverified and cannot make the View Missing. Lua preserves the current buffer and intent, shows a non-confirmable View-level root-missing diagnostic, permits ordinary refresh and destruction, and rejects write planning and same-instance navigation. FRED does not silently rebind the View to a newly created node at the same path because external identity is conservative.
 
-Same-instance `navigate` requires a clean View, invalidates only the old View generation, keeps InstanceId/buffer/windows/configuration/current presentation state, attaches a new View to the destination RootSession, updates buffer metadata, and resets the undo baseline. Creating a child instance instead leaves the parent View—including dirty text—intact until it is reopened or destroyed.
-
-### 10.7 Overlapping RootSessions
-
-After any successful or partially successful mutation, the runtime invalidates scan generations and schedules refresh for every attached RootSession whose root overlaps an affected path. This keeps parent-root and child-root Views consistent even though they do not share one RootSession.
+Creating a child Instance on a directory inside the parent session creates a new View over the same RootSession and selected `root_node_id`, snapshots expansion entries in that subtree, and leaves the parent View and dirty buffer intact. An independent direct nested root may still use another RootSession. Successful or partially successful mutation invalidates every attached RootSession whose session root overlaps an affected path.
 
 ## 11. Identity And Provenance
 
-Every rendered existing row has a full-line range extmark carrying its opaque RootSession-scoped `EntryId`. The range spans `[row, 0]` through `[row + 1, 0]` with `right_gravity = false`, `end_right_gravity = true`, `invalidate = true`, and `undo_restore = true`. Deleting the complete row during user edit capture invalidates the mark instead of moving a point mark onto an adjacent row. Renderer-owned reprojection, sorting, and post-apply synchronization run under an internal-sync guard that suppresses edit capture and discards/recreates identity marks; their invalidations never create delete intent. Marks and statuses bind to EntryId, not line number.
+Lua's shared `BufferProjectionEngine`, not an individual codec and not Rust, owns NodeId-to-row bindings. Every rendered semantic row receives a full-line range extmark mapped to its opaque RootSession-scoped NodeId. The range spans `[row, 0]` through `[row + 1, 0]` with `right_gravity = false`, `end_right_gravity = true`, `invalidate = true`, and `undo_restore = true`. Internal projection rendering runs under a Lua sync guard that suppresses edit capture and recreates bindings without generating filesystem intent.
 
-Identity rules:
+Identity rules are:
 
-- editing text preserves identity while one valid range extmark remains associated with that row;
-- moving text preserves identity only when Neovim moves that exact range with it;
-- an invalid range mark observed outside the internal-sync guard represents user removal of its bound row;
-- one rendered existing row cannot carry multiple valid existing EntryIds, and two rows cannot carry the same identity;
-- yank and put never copy an extmark;
-- a provenance-linked put receives a new pending identity with `copy_from = { root_session_id, entry_id }`;
-- provenance from another RootSession is never resolved or normalized as COPY/MOVE in the current View;
-- source removal plus one same-session destination may normalize that destination to MOVE;
-- if an extmark is lost for a reason other than range invalidation, FRED may rebind only through a unique, unconsumed, unchanged base path;
-- ambiguous lost identity is never guessed;
-- external rename is represented conservatively as deletion of the old path and creation of the new path.
+- editing text preserves NodeId while one valid range extmark remains associated with that row;
+- moving text preserves NodeId only when Neovim moves that exact range with it;
+- deleting the complete row outside the internal-sync guard invalidates its binding;
+- one row cannot carry multiple NodeIds, and two captured rows cannot carry the same NodeId;
+- a new unbound row receives a Rust-allocated NodeId before semantic capture;
+- an Existing node may change desired path but may not directly change kind;
+- a PendingCreate or PendingCopy node uses the same NodeId type as an Existing node; CREATE/COPY keeps that NodeId after success, while a unique removed-source destination normalized to MOVE is rebound to the source NodeId and retires its provisional destination NodeId;
+- if a binding is lost for a reason other than range invalidation, Lua may request rebind only through a unique, unconsumed, unchanged base path; ambiguous identity is never guessed;
+- external rename is represented conservatively as old-node deletion plus new-node creation.
 
-Hard links are separate namespace entries and receive separate EntryIds even when the operating system reports shared underlying storage.
+Extmarks do not travel through yank or put. Lua therefore owns register-qualified provenance:
+
+- `TextYankPost` records register name, text, register type, RootSessionId, and source NodeIds;
+- buffer-local `p` and `P` wrappers preserve native register, count, direction, undo, and cursor behavior, then inspect the inserted range;
+- provenance attaches only when the actual register still matches the recorded text and type and belongs to the same RootSession;
+- a valid provenance-linked destination initially receives a newly allocated NodeId with `origin = PendingCopy` and `copy_from = { root_session_id, node_id }`; if final state normalizes to MOVE, Rust rebinds that destination to the source NodeId and retires the provisional destination NodeId;
+- parent and child Views sharing one RootSession may exchange provenance; an independent overlapping RootSession may not;
+- insertions without valid provenance are PendingCreate declarations even when their text matches an existing row.
+
+Lua submits only the normalized `copy_from` reference. Rust validates same-session source identity and normalizes final desired state:
+
+```text
+source retained + destination
+  -> COPY or COPY_TREE
+
+source removed + one destination
+  -> MOVE
+
+source removed + multiple destinations
+  -> COPY each destination, then DELETE or DELETE_TREE source
+```
+
+Hard links are separate namespace nodes and receive separate NodeIds even when the operating system reports shared underlying storage.
 
 ## 12. Scanner, Coverage, And Watchers
 
-### 12.1 Scanner Events And Atomic Publication
+### 12.1 Scanner Events, Snapshot Publication, And Semantic Frames
 
-The scanner is a cancellable Rust worker task. A request includes:
+The scanner is a cancellable Rust worker task. Lua converts baseline depth, NodeId-keyed expansion, and explicit includes into projection-neutral directory scopes before requesting coverage:
 
 ```text
-root
-required directory scopes
-baseline depth
-local expansion overrides
-ignore matcher
-required metadata fields from configured columns and Lua presentation SortSpecs
-max_entries
-max_directories
-generation
+CoverageRequest {
+  view_id
+  coverage_generation
+  scopes: [
+    { directory_node_id, depth }
+  ]
+  ignore matcher
+  required metadata fields
+  max_entries
+  max_directories
+}
 ```
 
 The worker emits bounded events such as:
 
 ```text
-ScanBatch
+ScanNodeBatch
 MetadataBatch
 ScanProgress
 DirectoryComplete
@@ -1297,32 +1519,30 @@ ScanComplete
 ScanCancelled
 ```
 
-Requirements:
+After a candidate snapshot or semantic intent changes, Rust emits bounded `ViewSemanticFrame` events as defined in Section 10.5. Requirements are:
 
-- emit at most `render_batch_size` entries per batch and expose every entry in each requested scope to its attached Lua presentation catalog, regardless of hidden-file classification;
-- seal every frame with the exact `CatalogFrameToken` identity defined in Section 10.4;
-- accept at most one atomic `{ token, ordered_visible_ids }` submission for that token, and accept no partial pushes or later append;
-- require exact equality for every frame-bound token field, reject stale or reused tokens, and reject unknown or duplicate IDs;
-- allow any unique subset of frame IDs as projection absence without claiming semantic knowledge of Lua's intended visibility;
-- independently deduplicate and retain protected dirty, conflict, and validation rows according to Section 10.4;
-- commit buffer lines, extmarks, virtual text, and cursor reconciliation only after the atomic submission validates;
+- allocate or reuse RootSession-scoped NodeIds and construct `nodes_by_id`, `children_by_parent`, path index, directory status, and Confirmed/RetainedUnverified observation state as one self-consistent candidate snapshot;
+- emit at most `render_batch_size` node facts per batch and expose every node in each requested scope regardless of Lua hidden-file classification;
 - attach `scan_generation` to namespace events and `metadata_generation` plus `source_root_revision` to metadata events;
-- increment `metadata_generation` whenever required metadata fields change, a metadata request is cancelled, or a new namespace snapshot publishes;
-- accept a MetadataBatch only when its metadata generation is current, its source root revision still equals `root_revision`, every field remains required, and EntryId plus encoded path still match the current snapshot;
-- discard events from obsolete scan or metadata generations;
-- attach metadata observations to EntryId plus the observed encoded path so a late value cannot bind to a moved or replaced entry;
-- record each requested scope as complete, partial, or failed for that generation;
-- never follow a directory symlink;
+- discard obsolete scan, metadata, coverage, and View-frame generations;
+- record each requested directory NodeId as Complete, Partial, or Failed; Complete membership may remove absent prior children, while Partial/Failed membership must carry prior unobserved children forward as RetainedUnverified;
+- never create children for a symlink or recursively follow a directory-symlink target;
 - stop at configured limits and report partial coverage;
-- publish exactly one immutable snapshot only after every requested scope in the generation has reached a terminal result;
-- retain partial and failed scopes as non-authoritative status inside the published generation result;
-- keep Neovim calls on the main thread;
-- fetch stat metadata only when a configured column or Lua's current SortSpec requires it;
-- allow metadata-only enrichment to use the bounded Scan worker/channel without publishing a namespace snapshot or advancing `root_revision`;
-- publish accepted metadata batches by advancing only `metadata_revision` and re-rendering affected virtual columns;
-- treat metadata collection failure as a per-entry placeholder, not as a namespace scan failure.
+- publish exactly one immutable RootSnapshot only after every requested scope in the generation reaches a terminal result;
+- retain partial and failed scopes as non-authoritative status inside that published result;
+- build each ViewSemanticFrame from the current RootSnapshot plus that View's semantic intent, then stream bounded node and directory-membership batches with one sealed ViewFrameToken;
+- keep child membership free of View-specific sort order;
+- accept a post-render `ProjectionCommitRequest` only when its frame token is current and every submitted NodeId belongs to that frame exactly once;
+- accept a semantic `CaptureRequest` only when its projection revision and changedtick match the initiating Lua buffer state and all NodeIds are current, unique, and valid for that View;
+- accept a MetadataBatch only when its metadata generation and source RootRevision are current, every field remains required, and NodeId plus observed encoded path still match the current snapshot;
+- attach metadata observations to NodeId plus observed path so a late value cannot bind to a moved or replaced node;
+- fetch stat metadata only when a Lua column or SortSpec requires it;
+- allow metadata-only enrichment without publishing a namespace snapshot or advancing RootRevision;
+- publish accepted metadata by advancing only MetadataRevision and emitting updated semantic frame facts;
+- treat metadata collection failure as a per-node placeholder, not a namespace scan failure;
+- perform no direct FRED buffer, extmark, virtual-text, cursor, changedtick, or undo operation in Rust.
 
-Default limits:
+Default limits remain:
 
 ```lua
 max_entries = 50000
@@ -1336,18 +1556,20 @@ Reaching a limit or failing an unrelated directory produces a visible partial st
 
 A RootSession scans and watches the union of directories required by attached Views.
 
-Coverage includes:
+Lua derives coverage from:
 
 - each View's baseline depth;
-- local expansions;
-- directories needed to display pinned intent, conflict, and validation-error rows;
-- ancestor context needed by those rows.
+- directory NodeIds in that Instance's ExpansionState;
+- precise explicit includes and reveal ancestor chains;
+- directories required by Rust ViewIntent, conflict, validation, and unplaced-node context.
 
-Hidden-file visibility and Lua filtering do not reduce or expand coverage and never trigger a whole-root recursive scan. Rust still sends all entries from the already requested scopes. Explicit reveal may add a precise ancestor chain and ignore override; collapsing that chain releases the corresponding coverage normally.
+The Rust RootSession receives only directory NodeId plus depth scopes and reference-counts their union; it does not know whether a scope originated from a flat expansion, a future tree expansion, reveal, or semantic intent.
+
+Hidden-file visibility and Lua filtering do not reduce or expand coverage and never trigger a whole-root recursive scan. Rust still includes every node from already requested scopes in semantic frame facts. Explicit reveal may add a precise ancestor chain and ignore override; collapsing that chain releases the corresponding coverage normally.
 
 Coverage is reference-counted. When no attached View needs a directory, its watcher may be released and its cached state may cease to be authoritative. COPY_TREE and DELETE_TREE do not add descendant enumeration coverage.
 
-Metadata requirements are also reference-counted as the union of attached View columns and Lua presentation SortSpecs. Removing a column or changing sort reduces future metadata requirements without reducing directory coverage, but it does not promise object-level pruning of metadata already retained by a still-live RootSession. Namespace entry identity, path, kind, coverage authority, and previously cached metadata may remain until the whole RootSession is released.
+Metadata requirements are also reference-counted as the union of attached Lua View columns and SortSpecs. Removing a column or changing sort reduces future metadata requirements without reducing directory coverage, but it does not promise object-level pruning of metadata already retained by a still-live RootSession. Namespace NodeId, path, kind, parent/child membership, coverage authority, and previously cached metadata may remain until the whole RootSession is released.
 
 ### 12.3 Watcher Behavior
 
@@ -1386,7 +1608,7 @@ view = {
 
 When `hidden_files_visible` is false, Lua removes an ordinary entry when `is_hidden_file` classifies the entry itself or any covered ancestor directory as hidden. A hidden directory therefore hides its whole currently covered descendant subtree. When the boolean is true, these entries are included. This classification changes projection only: Rust scans only View-requested scopes, sends every entry in those scopes to Lua, and never expands coverage merely to evaluate hidden-file visibility.
 
-`instance:set_hidden_files_visible(value)` validates an actual boolean. `instance:toggle_hidden_files()` inverts the committed value. A same-value call is a no-op. For an actual change on an Open or lifecycle-Hidden instance, FRED captures intent, creates a proposed presentation generation, and schedules bounded/cancellable classification. The public method returns after immediate validation, intent capture, and scheduling; it does not return a promise or async result object. The committed getter value changes only after an atomic ordered-ID submission succeeds. Rust preserves protected dirty/conflict/error rows during reconciliation, then the synchronizer clears undo history and establishes a new baseline while retaining unapplied intent and `'modified'`, even if the visible order happened not to change. `reveal()` persistently enables visibility when needed and waits for that transition before cursor movement.
+`instance:set_hidden_files_visible(value)` validates an actual boolean. `instance:toggle_hidden_files()` inverts the committed value. A same-value call is a no-op. For an actual change on an Open or lifecycle-Hidden instance, Lua first captures semantic rows into Rust ViewIntent, creates a proposed presentation generation, and schedules bounded/cancellable classification over the current ViewSemanticFrame. The public method returns after immediate validation, capture, and scheduling; it does not return a promise or async result object. The committed getter value changes only after Lua renders and Rust accepts the resulting ProjectionCommitRequest. Dirty, pending, conflict, and validation nodes already belong to the ViewSemanticFrame. The Lua synchronizer clears undo history and establishes a new baseline while retaining unapplied intent and `'modified'`, even if visible membership happened not to change. `reveal()` persistently enables visibility when needed and waits for that transition before cursor movement.
 
 Sort uses one complete, fixed-shape specification:
 
@@ -1398,9 +1620,9 @@ sort = {
 }
 ```
 
-All three fields are required; unknown or missing fields and values are invalid. SortSpec is never deep-merged: every explicit table at setup, direct construction, parent-current snapshot selection, child override, or runtime setter independently contains exactly these three fields and replaces the prior SortSpec wholesale. Lua sorts the catalog after hidden-file filtering. Missing metadata always follows available metadata regardless of direction. Ascending `type` order is directory, file, symlink, other. `direction` reverses only the primary `by` comparison. Normalized path, exact path, and EntryId tie-breakers remain ascending in both directions.
+All three fields are required; unknown or missing fields and values are invalid. SortSpec is never deep-merged: every explicit table at setup, direct construction, parent-current snapshot selection, child override, or runtime setter independently contains exactly these three fields and replaces the prior SortSpec wholesale. After hidden-file filtering, Lua applies the comparator only to each directory's direct children, then performs depth-first traversal. A materialized directory row and its visible descendants therefore remain one contiguous subtree in both flat and future tree renderers. Missing metadata always follows available metadata regardless of direction. Ascending `type` order is directory, file, symlink, other. `direction` reverses only the primary `by` comparison. Normalized name/path, exact name/path, and NodeId tie-breakers remain ascending in both directions.
 
-`instance:set_sort(spec)` first normalizes the complete spec. An identical spec is an idempotent no-op even while dirty. A different spec on a dirty View throws a Lua exception and leaves state unchanged; there is no deferred request. On a clean Open or lifecycle-Hidden instance it creates a proposed presentation generation, requests only missing metadata required by its key, and schedules bounded/cancellable ordering. The method returns after immediate validation and scheduling, without an async result object. The getter changes only after the atomic order submission succeeds. Missing values may initially sort last; later metadata may reorder only a clean View. When a View becomes clean after being dirty, Lua reapplies the already-current sort. A changed SortSpec whose committed result leaves real-row order unchanged does not clear history; an actual real-row reorder does.
+`instance:set_sort(spec)` first normalizes the complete spec. An identical spec is an idempotent no-op even while dirty. A different spec on a dirty View throws a Lua exception and leaves state unchanged; there is no deferred request. On a clean Open or lifecycle-Hidden instance it creates a proposed presentation generation, requests only missing metadata required by its key, and schedules bounded/cancellable sibling ordering plus depth-first traversal. The method returns after immediate validation and scheduling, without an async result object. The getter changes only after the rendered projection commits successfully. Missing values may initially sort last; later metadata may reorder only a clean View. When a View becomes clean after being dirty, Lua reapplies the already-current sort. A changed SortSpec whose committed result leaves real-row order unchanged does not clear history; an actual real-row reorder does.
 
 Baseline depth semantics:
 
@@ -1408,11 +1630,11 @@ Baseline depth semantics:
 - `1`: direct entries plus children of direct directories;
 - `all`: no depth limit other than configured scan limits.
 
-Local expansion depth is relative to the selected directory. `actions.expand` expands one level; `actions.expand_recursive` requests recursive materialization subject to scan limits.
+Expansion depth is stored by directory NodeId and is relative to that selected directory. `actions.expand` records one level; `actions.expand_recursive` records recursive materialization subject to scan limits. Same-session navigation preserves these NodeIds. A child Instance snapshots expansion entries inside its selected root subtree and then evolves independently.
 
-Changing ignore rules requests a new browse scan. Changing hidden-file visibility only reprojects existing requested coverage. Changing sort changes only Lua presentation state and metadata requirements. Changing baseline depth, local expansion, or precise reveal coverage updates coverage. None of these changes generates filesystem intent.
+Changing ignore rules requests a new browse scan. Changing hidden-file visibility only reprojects existing requested coverage. Changing sort changes only Lua presentation state and metadata requirements. Changing baseline depth, NodeId-keyed expansion, or precise reveal coverage updates coverage. None of these changes generates filesystem intent.
 
-Default ordering is ascending, case-insensitive stable lexical ordering by normalized relative path. Destination collision checks use actual platform/filesystem behavior, while displayed spelling remains unchanged.
+Default ordering is ascending, case-insensitive stable lexical ordering within each direct sibling group, followed by depth-first traversal. Flat rendering still displays complete View-relative paths, but a directory's materialized descendants remain adjacent to that directory rather than being globally interleaved with another subtree. Destination collision checks use actual platform/filesystem behavior, while displayed spelling remains unchanged.
 
 ## 14. Planner
 
@@ -1423,7 +1645,8 @@ Inputs:
 ```text
 View edit-base snapshot and edit_base_revision
 current published snapshot and planned_root_revision
-captured View intent
+current View root_node_id
+captured View intent with desired View-relative paths anchored to that root
 current changedtick and intent generation
 immutable direct namespace-probe results for required sources, destinations, existing parents, and planned-parent chains
 path and platform rules
@@ -1558,7 +1781,7 @@ Every valid non-empty plan uses this single confirmation. An empty valid plan re
 
 ## 17. Executor And Failure Semantics
 
-The executor consumes a validated plan and is the only module allowed to mutate planned FRED buffer operations.
+The executor consumes a validated plan and is the only module allowed to mutate the filesystem for planned FRED operations. Lua remains the only owner of FRED buffer synchronization.
 
 After the user confirms a valid plan:
 
@@ -1604,7 +1827,7 @@ When every node reports success, FRED trusts those system API results.
 
 It then:
 
-- applies every completed node effect deterministically to the in-memory namespace model;
+- applies every completed node effect deterministically to the in-memory namespace model, preserving NodeId for successful logical MOVE and allocating/rebinding NodeIds according to the cross-filesystem and final-state rules in Sections 10 and 11;
 - publishes a new immutable model revision;
 - clears the initiating View's intent;
 - records a clean initiating-View projection from that model for the post-apply synchronizer;
@@ -1624,7 +1847,7 @@ On the first execution error, FRED:
 1. stops the batch;
 2. reports the failed system call through Neovim;
 3. records completed, failed, and unstarted nodes;
-4. applies only completed-node effects deterministically to the in-memory namespace model and publishes the resulting immutable model revision;
+4. applies only completed-node effects deterministically to the in-memory namespace model, including distinct source/destination NodeIds when cross-filesystem copy succeeds but source deletion fails, and publishes the resulting immutable model revision;
 5. abandons the initiating View's failed and unstarted intent from that apply attempt;
 6. records a clean initiating-View projection from the updated model for the post-apply synchronizer;
 7. invalidates overlapping RootSessions and queues best-effort filesystem refresh;
@@ -1657,7 +1880,8 @@ Rules:
 
 - disk namespace changed, user unchanged: accept disk state;
 - user changed, disk namespace still matches the edit base: keep user intent;
-- source path disappeared: conflict;
+- source path authoritatively disappeared from a Complete scope or direct probe: conflict;
+- source was merely unobserved in a Partial or Failed scope: retain it as Unknown rather than conflict;
 - source kind changed: conflict;
 - desired destination appeared or became occupied: conflict;
 - both disk and user changed the same namespace identity incompatibly: conflict;
@@ -1672,9 +1896,9 @@ The initiating View after a partial execution is the intentional exception: its 
 
 ## 19. Symlink Policy And Immediate Helper
 
-FRED scanning never recursively follows a directory symlink. Existing symlinks are leaf entries that may be listed, opened, renamed, copied, or deleted as links.
+FRED scanning never recursively follows a directory symlink. Every symlink remains a `kind = symlink` leaf Node even when normalized metadata reports `target_kind = directory`; it never owns a `children_by_parent` entry. Existing symlinks may be listed, opened, renamed, copied, or deleted as links. Inline expand/collapse on a symlink is rejected. An explicit action may resolve a directory-symlink target and open it in a new or child Instance backed by a separate exact-root RootSession, but same-instance `navigate()` never crosses into that session and target children are never mounted beneath the symlink NodeId in the current session.
 
-This prevents recursive cycles, alias-based duplicate traversal, and accidental ownership of a target outside the View root.
+This keeps RootSnapshot parent/child membership a tree rather than an alias graph, prevents recursive cycles and duplicate traversal, and avoids accidental ownership of a target outside the View root.
 
 Symlink creation is an immediate helper rather than a buffer-planned operation:
 
@@ -1707,25 +1931,22 @@ Cargo.toml
 build.rs
 src/
   lib.rs
-  nvim_adapter.rs
-  config.rs
+  native_bridge.rs
   runtime.rs
   apply_gate.rs
   root_session.rs
   snapshot.rs
+  node.rs
   view.rs
+  intent.rs
+  semantic_frame.rs
   task.rs
   scanner.rs
   metadata.rs
   watcher.rs
   coverage.rs
-  columns.rs
   model.rs
-  identity.rs
-  provenance.rs
   path.rs
-  projection.rs
-  edit.rs
   planner.rs
   conflict.rs
   preview.rs
@@ -1743,7 +1964,13 @@ lua/
   fred/keymaps.lua
   fred/lifecycle.lua
   fred/buffer.lua
+  fred/buffer_projection.lua
+  fred/projection_codec.lua
+  fred/flat_projection.lua
+  fred/projector.lua
   fred/presentation.lua
+  fred/columns.lua
+  fred/provenance.lua
   fred/layout.lua
 plugin/
   fred.lua
@@ -1753,24 +1980,31 @@ ftplugin/
 
 The modules expose small internal interfaces with substantial behavior behind them:
 
-- Rust `nvim_adapter` is the only Rust module that calls `nvim_oxi::api` directly and owns the exact-patch-tested buffer, extmark, virtual-text, changedtick, and main-thread notification bindings;
-- Rust `path` owns canonical buffer/native path conversion and validation;
-- Rust `snapshot` owns immutable revisioned namespace state;
-- Rust `root_session` owns shared scan, watcher, coverage, cache state, and strong/weak lifetime boundaries;
-- Rust `metadata` owns platform metadata collection and normalized optional values;
-- Rust `columns` owns built-in column definitions, formatting, alignment, and metadata requirements;
-- Rust `view` owns per-buffer coverage, keyed projection reconciliation, column layout, edit base, intent, conflicts, diagnostics, and protected-row state;
-- Rust `planner`, `tree_ops`, `executor`, and `apply_gate` own mutation planning and execution boundaries;
+- Rust `native_bridge` owns only exact-pair-tested native module registration, Lua/native argument and result conversion, `AsyncHandle` wakeups, and main-thread event delivery; it does not own FRED buffer APIs;
+- Rust `path` owns canonical native/session/View path conversion and validation;
+- Rust `node` owns the RootSession-scoped NodeId allocator and node lifecycle rules;
+- Rust `snapshot` owns immutable normalized `nodes_by_id`, `children_by_parent`, path indexes, directory status, and snapshot publication;
+- Rust `root_session` owns shared scan, watcher, coverage, metadata/cache state, exact-root weak registration, and strong/weak lifetime boundaries;
+- Rust `view` owns `root_node_id`, immutable edit base, semantic intent, CommittedProjection, and frame generations without owning a buffer number;
+- Rust `intent` owns capture validation and normalized Existing/PendingCreate/PendingCopy desired state;
+- Rust `semantic_frame` applies ViewIntent to RootSnapshot and emits bounded projection-neutral ViewSemanticFrame events;
+- Rust `metadata` owns platform metadata collection and normalized optional values requested by Lua columns and SortSpecs;
+- Rust `planner`, `tree_ops`, `executor`, and `apply_gate` own mutation planning, NodeId-preserving model transforms, partial-result identity rules, and execution boundaries;
 - Rust `runtime` owns RootSession/View registration, generation identity, overlap invalidation, and native handles exposed to Lua;
-- Lua `config` captures setup defaults, validates Lua-only callback/action/layout shapes, and resolves direct/child instance inheritance;
-- Lua `instance` owns the public object, root/config identity, and native handle calls;
+- Lua `config` captures setup defaults, validates Lua-only callback/action/layout/column shapes, and resolves direct/child instance inheritance;
+- Lua `instance` owns the public object, root/config identity, child RootSession lineage decisions, and native View handles;
 - Lua `registry` owns InstanceId/name/buffer lookup and terminal removal;
 - Lua `actions` and `keymaps` own function-valued actions, context construction, mode/lhs merge, and buffer-local installation;
-- Lua `presentation` owns runtime hidden-file visibility and SortSpec state, generation-tagged catalog mirroring, hidden classification/cache and subtree propagation, stable comparison, and ordered EntryId submission;
-- Lua `lifecycle` and `buffer` own Neovim autocmd-triggered reconciliation, `vim.b.fred`, FileType ordering, attach callbacks, the buffer-local `BufWriteCmd` planning handler plus `FileWriteCmd`/`FileAppendCmd` rejection handlers, generation-validated deferred post-write synchronization, Instance timers, setup-defined hidden-group LRUs/capacity enforcement, terminal destroy, and undo-baseline resets requested by presentation commits;
+- Lua `presentation` owns hidden-file visibility, SortSpec, MaterializationState, NodeId-keyed ExpansionState, presentation generations, and the ViewSemanticFrame catalog mirror;
+- Lua `projector` owns hidden subtree filtering, sibling-local sorting, depth-first traversal, and production of the common ProjectedRow sequence;
+- Lua `projection_codec` defines the internal sealed bidirectional codec contract; `flat_projection` is the only version-one implementation;
+- Lua `buffer_projection` owns line rendering/capture, full-line NodeId range extmarks, projection commits, changedtick, cursor reconciliation, modified state, undo baselines, internal-sync suppression, and deferred post-write synchronization;
+- Lua `columns` owns built-in column definitions, layout, display-width alignment, highlighted chunks, and metadata requirement declarations;
+- Lua `provenance` owns `TextYankPost`, register snapshots, `p`/`P` wrappers, inserted-range tracking, and normalized same-session `copy_from` capture;
+- Lua `lifecycle` and `buffer` own Neovim autocmd-triggered display reconciliation, `vim.b.fred`, FileType ordering, attach callbacks, `BufWriteCmd`, `FileWriteCmd`/`FileAppendCmd` rejection handlers, Instance timers, setup-defined hidden-group LRUs/capacity enforcement, and terminal destroy;
 - Lua `layout` constructs native buffer, float, split, vsplit, and tab displays and returns ordinary window ownership records.
 
-Rust module interfaces remain internal. `src/lib.rs` exposes the native module through `nvim-oxi`; `lua/fred/init.lua` exposes the stable Instance facade. No speculative backend or public custom-column seam is exposed in version one.
+Rust module interfaces remain internal. `src/lib.rs` exposes the native module through `nvim-oxi`; `lua/fred/init.lua` exposes the stable Instance facade. Version one exposes no backend, custom column, renderer, projection-mode, or custom ProjectionCodec registration seam.
 
 
 ## 21. Public Configuration
@@ -1845,7 +2079,7 @@ fred.setup({
 })
 ```
 
-Direct `fred.new(opts)` deep-merges setup defaults with explicit instance options, except function/list fields such as `on_attach`, which are normalized and concatenated deliberately, and SortSpec. Every explicitly supplied SortSpec at setup, direct `new()`, or child `new()` is validated independently as exactly `{ by, direction, case_sensitive }` and replaces the previous SortSpec wholesale. `instance:new(opts)` starts from the parent's resolved immutable options, replaces its initial hidden-file visibility and SortSpec with snapshots of the parent's current runtime values, then applies explicit child overrides; an explicit child SortSpec replaces that snapshot rather than merging with it. It does not replay setup callbacks. The resulting child values are part of the child's immutable `config()` snapshot, while later setters affect only its runtime getters.
+Direct `fred.new(opts)` deep-merges setup defaults with explicit instance options, except function/list fields such as `on_attach`, which are normalized and concatenated deliberately, and SortSpec. Every explicitly supplied SortSpec at setup, direct `new()`, or child `new()` is validated independently as exactly `{ by, direction, case_sensitive }` and replaces the previous SortSpec wholesale. `instance:new(opts)` starts from the parent's resolved immutable options, replaces its initial hidden-file visibility and SortSpec with snapshots of the parent's current runtime values, then applies explicit child overrides; an explicit child SortSpec replaces that snapshot rather than merging with it. It does not replay setup callbacks. When the child root is a directory inside the parent RootSession, the child also snapshots the parent's current NodeId-keyed expansion entries inside that subtree as runtime state; expansion is not added to immutable `config()`, and later parent/child expansion changes are independent. The resulting configured values are part of the child's immutable `config()` snapshot, while later setters affect only runtime getters and presentation state.
 
 `cleanup.instance` is inherited through resolved direct/child options and may be overridden per construction. `cleanup.groups` is setup-only, process-wide, and immutable after setup; supplying it to direct or child `new()` options is invalid. Every resolved `cleanup.instance.group` must name a setup-defined group, and unknown groups fail during `new()` validation.
 
@@ -1859,7 +2093,7 @@ Direct `fred.new(opts)` deep-merges setup defaults with explicit instance option
 
 `sort` is the complete three-field SortSpec described in Section 13. All fields are required, unknown fields are errors, and only the built-in single keys are supported. Arbitrary comparators, multi-key sorting, directory-first options, and configurable missing-value placement are not public version-one features.
 
-Watcher establishment, plan confirmation, and no-follow directory-symlink behavior remain automatic and non-configurable in version one.
+Watcher establishment, plan confirmation, no-follow directory-symlink behavior, and the internal FlatProjectionCodec remain automatic and non-configurable in version one. There is no `view_mode`, tree toggle, renderer selector, or custom ProjectionCodec option.
 
 `cleanup.instance.delay_ms` is a non-negative integer; `0` disables only the hidden-delay timer. `cleanup.instance.group` is a non-empty setup-defined group name. Each `cleanup.groups.<name>.capacity` is a non-negative integer; `0` means that group retains no Hidden instances. Timer expiry and group overflow are the only automatic destroy triggers and both use the same idempotent terminal path.
 
@@ -1903,231 +2137,130 @@ A layout-open failure rolls back only resources created by that open attempt. If
 
 ### 22.6 Presentation Error
 
-Immediate public-method validation errors and a different SortSpec on a dirty View throw directly to the caller and leave committed presentation state unchanged; identical normalized values are no-ops. During scheduled catalog processing, an `is_hidden_file` exception or non-boolean return propagates as the direct scheduled Neovim Lua error. FRED does not wrap it with `pcall`, return a structured error, or add another notification. The proposed transition is aborted before any `{ token, ordered_visible_ids }` submission, so the previous committed state and projection remain intact. Stale or superseded presentation generations cancel without submission. Public setters return after immediate validation and scheduling; they do not invent promise-like result objects.
+Immediate public-method validation errors and a different SortSpec on a dirty View throw directly to the caller and leave committed presentation state unchanged; identical normalized values are no-ops. During scheduled frame processing, an `is_hidden_file` exception, non-boolean return, codec error, stale frame token, unknown/duplicate NodeId, or ProjectionCommit rejection propagates as the direct Neovim Lua/native error. FRED does not add a projection lease, renderer rollback protocol, recovery state, promise-like result, or automatic retry. Classification or codec failure before rendering leaves the previous committed projection intact; render or commit failures are fail-fast and require an ordinary later refresh or reopen if the user wants to retry.
 
 ## 23. Testing Strategy
 
 ### 23.1 Rust Unit Tests
 
-- canonical path encoding and decoding;
-- decode-then-reencode equality;
-- malformed escapes, `%41` aliases, encoded separators, literal and encoded `.`/`..`, absolute paths, and root escape rejection;
-- Linux byte-path and Windows native-name conversion used by supported builds;
-- EntryId allocation, full-line range-extmark invalidation, exact start/end gravity, undo restoration, internal-sync suppression, duplicate-row rejection, and lost-mark rebinding rules;
-- register-content-qualified same-RootSession provenance, register overwrite invalidation, and normalization for retained source, one removed-source destination, and multiple removed-source destinations;
-- arbitrary projection omissions caused by ignore, hidden-file membership, ordering, depth, collapse, cancellation, failure, limits, or watcher gaps never generating deletion;
-- immutable direct namespace-probe inputs for missing sources, wrong kinds, occupied destinations, existing parents, planned-parent absence or planned occupant removal, nearest existing ancestors, and symlink parent traversal;
-- plans carrying distinct `edit_base_revision` and `planned_root_revision` tokens;
-- common post-lock finalization after preflight failure, success, and execution failure;
-- directory-row deletion hiding unedited descendants;
-- descendant evacuation from DELETE_TREE and parent MOVE;
-- directory COPY_TREE/MOVE-to-self and descendant rejection;
-- conditional nested directory move ordering;
-- duplicate targets and explicit replacement;
-- rename swaps, cycles, and case-only renames;
-- DAG topological ordering;
-- ignore rule negation and browse traversal semantics;
-- namespace-only three-way refresh and conflict classification;
-- file content, size, and mtime changes not producing conflicts;
-- external rename represented as delete plus create;
-- immutable edit-base retention and candidate snapshot publication;
-- RootSession coverage reference counting;
-- sealed CatalogFrameToken equality, single-use atomic submission, and stale/reused/unknown/duplicate-ID rejection;
-- arbitrary unique frame-ID subsets remaining valid projection absence while protected dirty intent, conflict, and validation rows survive deduplicated reconciliation;
-- protected-row predecessor/successor anchoring, deterministic fallback, relative-order preservation, and no duplicate EntryId;
-- column registry validation, virtual-text rendering, fixed-width alignment, metadata placeholders, and metadata-only refresh;
-- column and Lua SortSpec metadata requirements fetching only the required stat fields;
-- RootSession Weak-registry behavior, View/task strong ownership, last-View cancellation, and natural final release of snapshots, metadata/cache state, and watchers;
-- cancelled or obsolete generations releasing provisional state promptly through ownership without a Rust retention policy;
-- metadata-generation cancellation and MetadataBatch rejection for stale-generation/current-source-revision and current-generation/stale-source-revision cases after column, Lua SortSpec, path, and namespace-revision changes;
-- renderer reconciliation consuming already-ordered IDs without owning Lua comparator or classification behavior;
-- same-instance navigation rebasing complete paths to the new current root and rejecting dirty View navigation;
-- destroying a View releasing shared references without deleting still-referenced RootSession data.
+- canonical native/session/View path encoding, decoding, rebasing, and root-escape rejection;
+- malformed escapes, encoded separators, literal and encoded `.`/`..`, absolute paths, Linux byte paths, and Windows native names;
+- RootSnapshot builder invariants for `nodes_by_id`, `children_by_parent`, path index, one-parent membership, directory-only parents, immutable publication, and Complete-versus-Partial/Failed authority merging;
+- one RootSession-scoped NodeId type across Existing, PendingCreate, PendingCopy, dirty move, successful create/copy, and conflict state, including provisional-destination retirement when normalization produces MOVE;
+- same-path lineage reuse, FRED rename/MOVE identity preservation, external rename as delete-plus-create, COPY destination allocation, and hard-link separation;
+- same-filesystem MOVE, fully successful cross-filesystem MOVE, copy-success/delete-failure two-NodeId result, and partial COPY_TREE destination discovery;
+- session root NodeId, movable View `root_node_id`, View-relative/session-relative rebasing, descendant navigation without RootSession replacement, dirty View-relative intent following a same-session root-node MOVE, and root-node Missing only after authoritative deletion;
+- exact-root RootSession reuse, parent/child lineage sharing, independent overlapping direct roots, and overlap invalidation;
+- directory symlink leaf invariants, target-kind metadata, no child membership, no recursive traversal, and explicit target-root separation;
+- ViewIntent capture validation for stale projection revision, changedtick, unknown/duplicate NodeId, existing-kind change, pending-node scope, duplicate destination, and same-session provenance;
+- CommittedProjection membership as the sole projection-deletion baseline;
+- RootSnapshot plus ViewIntent production of clean, dirty, pending, moved, conflict, validation, deleted-directory suppression, and evacuated-descendant ViewSemanticFrame nodes;
+- sealed ViewFrameToken currency and stale/mixed frame-event rejection;
+- immutable direct namespace-probe inputs for sources, destinations, existing parents, planned-parent chains, nearest ancestors, and symlink traversal;
+- pure planner normalization for create, copy, copy-tree, move, delete, delete-tree, replacement, multiple provenance destinations, rename cycles, and conditional directory ordering;
+- common post-lock finalization, serial fail-stop execution, completed-effect model publication, and no operation after the first injected failure;
+- metadata-generation/source-revision checks and NodeId-plus-observed-path binding;
+- RootSession Weak registry behavior, View/task strong ownership, cancellation, and natural final release.
 
 ### 23.2 Lua Unit Tests
 
-- normalization and validation of the complete three-field single-key SortSpec, including exact-field checks, no-deep-merge replacement at every configuration boundary, and idempotent equality;
-- runtime getters returning read-only committed-state copies without mutating the immutable construction snapshot;
-- Created-state setters updating only Lua state without View work, and opened setters committing state only after successful submission;
-- `is_hidden_file` receiving only canonical encoded root-relative path plus immutable root/kind facts and rejecting non-boolean returns;
-- hidden-file classification caching and invalidation when path, root, kind, callback identity, or presentation generation changes;
-- hidden-directory classification propagating to every currently covered descendant while visibility is disabled;
-- filter-then-sort behavior for every built-in key, both directions, case sensitivity, missing-values-last, type ordering, primary-only direction reversal, and ascending tie-breakers;
-- bounded/cancellable catalog classification and sorting yielding event-loop progress on large catalogs;
-- exact stale `presentation_generation` cancellation before atomic submission;
-- frozen dirty full-catalog order, membership-only visibility changes, deterministic newly discovered-ID fallback, and clean recomputation;
-- visibility state and SortSpec proposals rolling back when validation, callback execution, or boolean-return validation fails;
-- same-value hidden visibility and identical normalized SortSpec calls remaining no-ops;
-- child construction snapshotting parent current presentation values, applying explicit overrides, and remaining independent of later parent changes;
-- `cleanup.instance` inheritance and overrides, setup-only immutable group definitions, unknown-group rejection, Hidden-only LRU membership, newest reinsertion, oldest-first capacity eviction, `capacity = 0`, `delay_ms = 0`, and timer/LRU convergence on one idempotent destroy path;
-- deferred post-write projection tokens validating Instance/View generations, terminal destroy discarding pending projection state, and stale synchronizer callbacks remaining no-ops;
-- direct instance root defaulting to cwd and child root defaulting to the parent's current root.
+- complete SortSpec normalization, wholesale replacement, equality no-op, missing-values-last, and fixed tie-breakers;
+- hidden-file callback inputs, boolean enforcement, hidden-directory subtree propagation, and cache invalidation;
+- sibling-local sorting followed by depth-first traversal for every sort key and direction, with every materialized directory subtree contiguous;
+- identical ProjectedRow NodeId order feeding FlatProjectionCodec and a test-only tree-shaped codec fixture;
+- MaterializationState baseline depth, NodeId-keyed expansions, recursive depth, explicit includes, and coverage-request generation;
+- same-instance root-node change retaining expansion, parent/child subtree expansion snapshot, later independence, directory MOVE retention, and COPY non-inheritance;
+- catalog mirror assembly from bounded frame events and stale/mixed token rejection;
+- FlatProjectionCodec canonical line encode/decode and no public projection-mode or codec registry;
+- BufferProjectionEngine full-line NodeId range extmarks, exact gravity, invalidation, undo restoration, internal-sync suppression, duplicate binding rejection, and unique-path rebind only;
+- unbound-row NodeId allocation before capture and provisional-destination-to-source NodeId rebinding for normalized MOVE, including bindings, cursor, and expansion remap;
+- `TextYankPost`, register content/type qualification, `p`/`P` native behavior, same-session parent/child provenance, independent-session rejection, and PendingCopy capture;
+- Lua columns, virtual-text alignment, display-cell widths, placeholders, metadata requirements, and no editable-text pollution;
+- changedtick, modified state, undo baselines, cursor-by-NodeId reconciliation, deferred post-write generation validation, and terminal-destroy no-op callbacks;
+- Created/Open/Hidden/Destroyed lifecycle, cleanup timers/group LRUs, configuration inheritance, callbacks, keymaps, and layouts.
 
 ### 23.3 Integration Tests
 
-- recursive and selectively materialized local scanning;
-- one immutable snapshot publication only after every requested scope in a scan generation reaches a terminal result;
-- partial and failed scopes remaining non-authoritative inside the published generation result;
-- cancellation and late-generation rejection;
-- bounded Rust catalog batches containing all entries in requested scopes without hidden-file-driven coverage expansion;
-- end-to-end hidden-directory subtree projection and fixed SortSpec ordering across Rust catalog delivery, Lua presentation, and Rust reconciliation;
-- sealed atomic ordered-ID submission rejecting stale tokens and duplicate or unknown IDs without partial rendering, while accepting any unique frame-ID subset;
-- partial scan limits while unrelated known intents remain applicable;
-- watcher establishment failure while direct plan probes and final-preflight checks remain usable;
-- ignore, Lua hidden-file filtering, Lua sorting, depth, expansion, collapse, scan cancellation, scan failure, scan limits, and watcher gaps never generating deletion;
-- ordinary file and directory CREATE, MOVE, DELETE, COPY, and REPLACE;
-- focused `:FredNew file` and `:FredNew dir` behavior;
-- DELETE_TREE without descendant enumeration;
-- COPY_TREE as one logical plan and a deep executor operation;
-- COPY_TREE partial failure leaving an actual partial destination;
-- symlink leaf behavior and no-follow scanning;
-- immediate `:FredLink` with absolute and relative paths;
-- hard links represented as separate entries;
-- Unicode and unusual filenames;
-- permission and file-lock failures;
-- immutable pre-plan namespace probes repeated under the global lock;
-- destination appearing between planning and execution without overwrite;
-- source missing or changing kind between planning and execution;
-- missing destination parents that are not planned, absent and replacement-created parent chains ordered before child installation, non-directory parents or nearest existing ancestors, and parent traversal through a symlink;
-- independent edit-base and planned-root revision mismatch rejection;
-- rename swaps and case-only rename internal names;
-- common post-lock finalization after final-preflight failure, success, and execution failure;
-- completed-node results updating the in-memory model after success and partial failure;
-- refresh failure reporting without an apply-blocking special state;
-- fail-stop behavior at every executor node;
-- no later operation after the first error;
-- partial failure retaining completed effects and abandoning failed/unstarted initiating intent;
-- cross-filesystem file and directory MOVE;
-- cross-filesystem copy success followed by source deletion failure;
-- process restart performing an ordinary scan of partial results;
-- column changes while Views are clean and dirty without changing editable lines or intent;
-- metadata refresh after size, permission, or timestamp changes;
-- RootSession Weak registry entries not retaining sessions after View/task release;
-- last-View detach cancelling root work with no consumers and active tasks delaying final RootSession release until completion/cancellation;
-- per-generation scan limits and bounded provisional batches without asserting a cumulative cache bound for a long-lived RootSession that visits disjoint scopes;
-- final View/task release dropping the whole RootSession and all cache retained from previously visited scopes;
-- the Rust/Lua boundary exposing no Instance cleanup timer, group, capacity, LRU, idle-age, memory-estimate, entry-count, pruning, or sweeper policy to Rust;
-- exact virtual-column fixture without `/NNN` or `../`, with raw buffer lines containing only paths;
-- stale metadata events after cancellation, column changes, SortSpec changes, entry moves, and snapshot publication, including independent stale-generation/current-source-revision and current-generation/stale-source-revision fixtures;
-- stale presentation-generation cancellation across visibility, SortSpec, clean/dirty regime, and superseding-transition changes;
-- dirty hidden-file reprojection using frozen full-catalog order, deterministic new-ID fallback, protected-row deduplication/anchors, and omission remaining non-deletion;
-- exact reveal through ignored or uncovered and hidden ancestor chains, fact acquisition before classification, persistent hidden-file visibility, history reset, normal expansion state, and no reveal pin;
-- child creation snapshotting the parent's current hidden-file visibility and SortSpec into the child's immutable initial configuration;
-- same-instance navigation producing a newly rebased flat projection while child-instance navigation preserves the parent View.
+- exact-pair native build/load, bounded worker events, main-thread delivery, and absence of Rust FRED-buffer calls;
+- recursive and selectively materialized scanning into immutable normalized RootSnapshots;
+- one snapshot publication only after all requested scopes are terminal;
+- Complete scopes authoritatively replacing child membership while Partial/Failed scopes retain prior unobserved nodes as RetainedUnverified;
+- dirty rebase, conflict detection, projection, and descendant-root status treating RetainedUnverified nodes as Unknown rather than deleted;
+- RootSnapshot-to-ViewSemanticFrame event delivery, Lua catalog assembly, common projection, FlatProjectionCodec rendering, and ProjectionCommit;
+- arbitrary frame/catalog omission from hidden, ignore, depth, collapse, cancellation, failure, limits, or watcher gaps never generating deletion;
+- removal of a NodeId that belonged to CommittedProjection generating deletion intent;
+- different exact-root Views sharing snapshots; parent/child and navigate lineage sharing one RootSession and NodeIds; independent nested direct roots remaining separate;
+- same-instance navigation preserving buffer/Instance/View/RootSession/NodeIds and rebasing View-relative paths;
+- one dirty View root moved or deleted by another FRED View or external refresh: MOVE follows the stable NodeId and re-bases desired View-relative intent, while authoritative deletion preserves the buffer/intent under a non-confirmable root-missing diagnostic and blocks planning/navigation but permits refresh/destroy;
+- Partial/Failed non-observation of that root retaining Present/unverified status rather than producing a Missing-root diagnostic;
+- child-instance creation sharing the parent session, snapshotting subtree expansion, transferring the window, and preserving the parent dirty buffer;
+- directory symlink display as a leaf, inline expansion rejection, link operations affecting the link, and explicit target opening in a separate RootSession;
+- watcher-driven clean refresh and dirty semantic rebase across same and overlapping sessions;
+- ordinary CREATE, MOVE, DELETE, COPY, REPLACE, COPY_TREE, DELETE_TREE, descendant evacuation, and directory-row suppression;
+- normal yank/put provenance, `gp`, deterministic `_N` names, multiple copy destinations, and cross-session rejection;
+- direct namespace probes and final preflight for missing sources, wrong kinds, occupied destinations, planned parents, non-directory ancestors, and symlink traversal;
+- destination races using no-replace behavior;
+- same- and cross-filesystem file/directory MOVE, including source-delete failure identity splitting;
+- COPY_TREE partial failure, serial fail-stop behavior, completed/failed/unstarted reporting, and best-effort refresh;
+- metadata-only updates, Lua column refresh, clean sibling reorder, dirty real-row freeze, and reapplication on becoming clean;
+- reveal through ignored/uncovered/hidden ancestors without changing root;
+- successful and failed `:FredLink` global-lock release and overlapping refresh.
 
 ### 23.4 Headless Neovim Tests
 
-- build and load with every exact allowlisted Neovim 0.12 patch-version and pinned `nvim-oxi` revision pair;
-- Linux and Windows build/load coverage plus a direct-API compatibility spike for every `nvim_adapter` call in each listed pair;
-- `require("fred").build()` availability;
-- setup, direct-instance, and child-instance configuration validation, including exact complete SortSpecs with wholesale replacement, hidden-file callbacks, runtime getters, Created-state setters, and current-presentation child inheritance;
-- real-buffer hidden-directory subtree propagation plus primary-direction and ascending-tie-break SortSpec behavior;
-- command registration plus function-valued mode-grouped keymaps with `false` removal, no action strings, and no public apply/save command, action, Instance method, or default mapping;
-- focused `:FredNew file` and `:FredNew dir` commands;
-- one Instance owning one buffer/View while multiple instances and windows share one RootSession safely;
-- immutable edit-base snapshots in dirty Views;
-- process-global mutation lock across same, unrelated, and nested roots;
-- successful and failed `:FredLink` paths both releasing the global lock, invalidating and refreshing overlapping RootSessions when namespace may have changed, and allowing a later current-buffer write or `:FredLink`;
-- different depth and expansion settings per View;
-- union watcher coverage across Views;
-- unconditional watcher establishment attempts, degraded establishment failure, and manual refresh;
-- watcher-driven clean refresh and dirty namespace rebase;
-- overlapping RootSession invalidation after mutation;
-- `buftype=acwrite` current-buffer full `:write`, `:update`, and `:wq` behavior for one visible Open Instance only, including current-buffer/registration/display validation, exact FRED-URI target validation, a `BufWriteCmd` outcome table, deferred capture-suppressed projection, and execution failure that leaves `:wq` open after synchronizing a clean model;
-- buffer-local `FileWriteCmd` and `FileAppendCmd` always rejecting ranged and append writes before ordinary file I/O without entering planning, plus `BufWriteCmd` rejection of alternate targets, non-current buffers, Hidden Instances, and mismatched registration, with one write never processing other loaded instances;
-- successful `:wq` followed by immediate Hidden cleanup, including `capacity = 0`, discarding its generation-tagged pending projection so the deferred synchronizer is a no-op without recreating the destroyed Instance/View;
-- valid non-empty plans requiring one confirmation;
-- invalid/conflicted planning results opening non-confirmable diagnostics and preserving edits;
-- empty plan reprojection and modified-state clearing;
-- preview cancellation preserving edits;
-- final-preflight failure leaving Apply and releasing the global lock while preserving dirty state;
-- undo and redo before writing the current Open buffer;
-- undo baseline reset after successful write-driven execution and execution-failure model re-render;
-- dirty `set_hidden_files_visible()`/`toggle_hidden_files()` capture, frozen-order membership change, protected-row reconciliation, history reset after every actual boolean change, preserved intent, and same-value no-op;
-- clean sort state change with history reset only on real-row reorder, dirty changed-SortSpec exception, dirty identical-SortSpec no-op, and absence of any deferred requested sort;
-- cursor and identity preservation after refresh;
-- ignore, Lua hidden-file filtering, Lua sorting, depth, collapse, cancellation, scan failure, limits, and watcher gaps never implying deletion;
-- Neovim 0.12 buffer-local `p`/`P` wrappers preserving native put behavior while validating register name, text, type, and same-RootSession provenance;
-- register overwrite invalidation, cross-RootSession `gp` rejection, and foreign or unobserved matching insertions remaining CREATE;
-- `gp` into a directory and deterministic `_N` destinations;
-- collapse preserving pending-intent, conflict, and validation rows while ordinary reveal expansions collapse normally;
-- partial scan warnings without global apply disablement;
-- large-batch rendering responsiveness;
-- bounded/cancellable Lua hidden classification and sorting making observable event-loop progress, and stale presentation generations never committing after supersession;
-- worker notification through entry-count- or time-bounded `AsyncHandle` queue batches that re-wake while events remain;
-- virtual columns not changing buffer text, changedtick, undo history, or path parsing;
-- configuring every built-in column and rejecting invalid column, hidden-file, SortSpec, cleanup delay/group/capacity, unknown-group, and setup-only-group override values;
-- clean metadata sort reordering with history reset, dirty metadata virtual-column refresh without real-line movement, and current-sort reapplication on becoming clean;
-- aligned placeholders and display-cell widths for narrow and wide icon glyphs;
-- `fred.new()` setup merge, `instance:new()` current-presentation snapshot plus parent-option inheritance, immutable resolved config, runtime presentation getters, and no duplicate setup attach callbacks;
-- optional live-name uniqueness and InstanceId/name/buffer registry lookup validation;
-- direct `fred.new()` root defaulting to cwd, `parent:new()` root defaulting to the parent's current root, per-open layout selection when creating a display, ignored layout overrides when default `open()` focuses, and root absence from `open()` options;
-- one instance buffer displayed in multiple windows and multiple tabpages;
-- native Lua layout construction without NUI or layout types leaking into Instance/View/RootSession core types;
-- borrowed-buffer restore, owned float/split/tab hide, and final ordinary-window preservation;
-- `open()` focusing an existing current-tab display by default, `new_display = true` creating an additional display, `hide()` targeting current/explicit windows, and no public close/hide-all;
-- `toggle()` hiding every current-tab display including floats while leaving other tabs untouched, or opening when none exist;
-- default directory action creating a child instance and transferring the triggering window without custom history;
-- Created/Open/Hidden transitions derived by reconciliation triggered by `WinNew`, `BufWinEnter`, `WinEnter`, deferred `WinClosed`, and `BufHidden`, with validated `BufDelete`/`BufWipeout` entering terminal Destroyed directly;
-- Hidden-instance timer cancellation on redisplay, `delay_ms = 0` disabling only the timer, group-LRU newest reinsertion on rehide, oldest-first overflow eviction, `capacity = 0`, and timer/LRU races sharing one idempotent terminal path;
-- hidden dirty buffers remaining available for a later write after reopening, then discarding text/intent without filesystem mutation when either cleanup trigger destroys them;
-- Hidden `instance:refresh()`/`:FredRefresh` rejection, `instance:refresh()` succeeding for any reopened Open/displayed Instance even when non-current, and `:FredRefresh` remaining current-buffer-only;
-- fixed `filetype=fred`, complete `vim.b[bufnr].fred` before FileType autocmds, and live instance lookup by buffer;
-- keymap installation before FileType, then setup attach callbacks, then instance callbacks;
-- `on_attach` function/list normalization, one execution per buffer, and fail-fast rollback/destruction;
-- action `ctx` construction, optional opts, explicit entry/selection behavior, `actions.select()` function dispatch, and the renamed `actions.toggle_hidden_files` mapping;
-- the public Instance/action surface exposing only the approved hidden-file methods and action, with no compatibility aliases for superseded names;
-- absence of a sort command, picker, or built-in sort action and direct custom mappings through `ctx.instance:set_sort()`;
-- `is_hidden_file` exceptions and non-boolean returns propagating directly through Neovim while the previous committed state/projection remains intact;
-- reveal accepting only root-relative paths, establishing ignore overrides and ancestor EntryFacts before classification, persistently enabling hidden-file visibility with history reset, expanding ancestors, and moving the cursor;
-- same-instance clean navigation preserving buffer/window/config while resetting View/RootSession/projection/undo baseline;
-- layout-open failure rollback for a new or already valid instance.
+- real `filetype=fred`, `buftype=acwrite` buffers rendered exclusively by Lua;
+- no `/NNN` identity prefix or `../` row and only complete View-relative paths in version-one editable lines;
+- buffer-local `BufWriteCmd`, `FileWriteCmd`, and `FileAppendCmd` validation for current/Open/displayed/exact-URI/full-buffer rules;
+- synchronous Lua semantic capture before Rust planning and deferred Lua frame rendering after write outcomes;
+- valid plan confirmation, invalid/conflicted diagnostics, empty-plan synchronization, cancellation, stale revisions, and final-preflight failure;
+- success, execution failure, `:wq`, immediate Hidden cleanup, destroyed pending projection, modified state, and undo-baseline behavior;
+- actual range-extmark behavior under edit, delete, move, yank, put, undo, redo, internal render, sort, refresh, and cursor reconciliation;
+- large-frame bounded Lua classification, sibling sorting, DFS projection, rendering, and event-loop progress;
+- columns and metadata refresh without changing path text or filesystem intent;
+- native layouts, multi-window displays, FileType/on_attach ordering, action contexts, registry lookup, cleanup races, and hidden-buffer reopening;
+- absence of public tree mode, projection toggle, renderer selector, custom codec registration, or compatibility alias.
 
 ### 23.5 Property Tests
 
-Randomly generated snapshots and intents must preserve:
+Randomly generated snapshots, semantic frames, captures, and intents must preserve:
 
-- no duplicate final destinations;
-- no buffer-planned operation outside the View root;
-- no missing DAG dependencies;
-- topological sortability after rename-cycle resolution;
-- no directory COPY_TREE or MOVE into itself;
-- all register-qualified same-RootSession provenance copies before removed-source deletion;
-- register overwrite or cross-RootSession provenance never generating COPY or MOVE;
-- user line deletion invalidating exactly one full-line EntryId range while internal synchronization generates no filesystem intent;
-- every accepted ordered-ID submission using a current single-use token and a unique subset of frame IDs, with omission never authorizing deletion and protected rows never disappearing or duplicating;
-- hidden-directory classification hiding every covered descendant when hidden files are not visible;
-- no operation after the first injected execution error;
-- ignore, Lua hidden-file filtering, Lua sorting, depth, expansion, collapse, scan cancellation, scan failure, limits, watcher gaps, reveal, layout, and instance lifecycle do not change filesystem intent;
-- no silent overwrite under injected destination races;
-- a required parent must exist or be created earlier by the same plan, including replacement-created parents whose occupant first vacates, while unrelated occupants, non-directory parents or nearest existing ancestors, and symlink parent traversal reject the affected plan;
-- a scan generation publishes at most one immutable current snapshot and only after all requested scopes are terminal;
-- every post-lock outcome leaves Apply and releases the global mutation lock;
-- completed execution-node results deterministically produce the same in-memory namespace model;
-- shared coverage equals the union of attached View requirements;
-- dirty View rebase always retains its immutable edit base until rebase completes;
-- metadata columns, sorting, Instance cleanup, and RootSession ownership release never change filesystem intent;
-- a Weak registry reference never keeps a RootSession alive, while every View/task strong reference does;
-- destroying one instance cannot release RootSession objects referenced by another instance or active task;
-- a live Instance maps to at most one buffer/View even when arbitrarily many windows display it;
-- no Hidden-instance cleanup trigger can destroy an Instance while any window displays its buffer;
-- an unwritten View can disappear only through explicit destruction, external buffer wipeout, hidden-delay expiry, or hidden-group eviction, and that disappearance produces no filesystem operation.
+- normalized Snapshot parent/child/path-index consistency;
+- Complete child membership authorizing removal while Partial/Failed child membership preserves old unobserved nodes as Unknown;
+- one NodeId per semantic node and no duplicate child membership;
+- no child membership under symlinks;
+- View-relative/session-relative round-trip under arbitrary descendant root nodes;
+- dirty View-relative intent follows a moved root NodeId; an authoritatively removed root cannot silently bind to a replacement node; Partial/Failed non-observation cannot mark it Missing;
+- sibling-only sorting and contiguous DFS subtrees;
+- accepted ProjectionCommit NodeIds are a unique subset of one current frame;
+- projection absence never authorizes deletion;
+- user removal affects only NodeIds from the initiating CommittedProjection;
+- hidden, sort, depth, expansion, collapse, renderer choice, layout, and lifecycle do not change semantic intent by themselves;
+- no duplicate final destinations and no operation outside the View root;
+- provenance copies precede removed-source deletion;
+- directory move/copy never targets itself or a descendant;
+- every required parent exists or is created earlier by the same plan;
+- no silent overwrite under injected races;
+- no execution node runs after the first failure;
+- successful logical MOVE leaves one NodeId at the destination, while copy-success/delete-failure leaves distinct source and destination NodeIds;
+- a scan generation publishes at most one immutable snapshot after all scopes terminate;
+- every post-lock outcome releases the process-global mutation gate;
+- View/task references, not registries or expansion state, determine RootSession lifetime.
 
 ## 24. Performance Requirements
 
 - Scanning and rendering must not block Neovim beyond one bounded main-thread batch.
-- Root, depth, expansion, ignore, or explicit refresh changes cancel obsolete scan generations.
+- Coverage, depth, NodeId-keyed expansion, ignore, or explicit refresh changes cancel obsolete scan generations; same-session `root_node_id` changes invalidate obsolete View frames without replacing the RootSession.
 - Late events from cancelled generations are ignored.
 - Large COPY_TREE operations run on a worker thread through the deep tree operation module.
-- Provisional scan results may be displayed without becoming an authoritative dirty-View merge base.
-- Lua consumes bounded catalog batches and performs cancellable hidden classification and comparison in bounded main-thread slices that yield observable event-loop progress; stable global ordering is committed after the relevant scan generation reaches terminal state, while interim order may be provisional.
-- Atomic ordered-ID submissions are one-shot and sealed-token-bound; a stale presentation generation cancels work before submission and cannot mutate the buffer.
-- Re-rendering preserves cursor by EntryId when possible.
-- Multiple Views share snapshot and watcher data rather than rescanning one canonical root independently.
-- Per-generation scan work and each Lua View catalog scale linearly with that request's covered entries, while a still-live RootSession cache may scale with scopes visited across many generations rather than only current View coverage.
+- Scan progress may be displayed while candidate nodes remain internal; editable node projection begins only from a ViewSemanticFrame built after atomic RootSnapshot publication.
+- Lua consumes bounded ViewSemanticFrame batches and performs cancellable hidden classification, sibling sorting, and depth-first traversal in bounded main-thread slices that yield observable event-loop progress; it may yield between slices, but only a completed current frame is rendered and committed.
+- ProjectionCommit requests are sealed-frame-bound and reject stale tokens or unknown/duplicate NodeIds; a stale presentation generation cancels before Lua renders or commits a newer projection.
+- Re-rendering preserves cursor by NodeId when possible.
+- Exact-root Views and explicit parent/child/navigate lineage Views share RootSession snapshot and watcher data; independent overlapping direct roots remain separate and use overlap invalidation.
+- Per-generation scan work, Rust semantic-frame construction, each Lua catalog mirror, and common projection scale linearly with that View's covered nodes, while a still-live RootSession cache may scale with scopes visited across many generations rather than only current View coverage.
 - Obsolete snapshot versions are released when no View or active task strongly references them; the current snapshot drops with its RootSession.
 - Stat metadata is fetched only for columns and Lua SortSpecs that require it; metadata-only refresh must not trigger unnecessary namespace planning.
-- Metadata sorting may reorder only clean Views; dirty Views freeze real-line order while virtual columns continue to refresh, then reapply the already-current sort when clean.
+- Metadata sorting may reorder only clean Views; dirty Views freeze sibling-local real-line orders while virtual columns continue to refresh, then reapply the already-current sort and DFS traversal when clean.
 - RootSession provisional task-owned state is released promptly on cancellation; `max_entries`/`max_directories` and bounded channels/batches constrain each requested generation, not cumulative cache retained by a still-live RootSession.
 - Instance window bookkeeping is proportional to actual displays and does not duplicate scan/snapshot data.
 - Lua Instance cleanup uses at most one timer per Hidden Instance plus O(1) group-LRU membership updates; redisplay cancels/removes them without polling keyboard activity, and capacity overflow evicts oldest Hidden instances.
@@ -2136,98 +2269,98 @@ Randomly generated snapshots and intents must preserve:
 
 ## 25. Implementation Sequence
 
-All Section 26 acceptance criteria define the version-one contract. Development proceeds through runnable internal milestones so validation does not wait for the complete mutation stack:
+All Section 26 acceptance criteria define the version-one contract. Development proceeds through runnable internal milestones:
 
 ```text
-M0  exact-pair build/load, native loader, Instance lifecycle, and empty View
-M1  read-only scanning, flat projection, Lua hidden-file presentation/sort, and metadata
-M2  shared RootSession data, watchers, dirty-View edit bases, and namespace rebase
-M3  range EntryIds, edit capture, same-session provenance, pure planner, and preview
-M4  synchronous write integration, global mutation gate, executor, and failure reporting
-M5  cross-filesystem and rename-cycle hardening plus the complete Linux/Windows matrix
+M0  exact-pair native bridge, Lua Instance lifecycle, BufferProjectionEngine, and empty View
+M1  NodeId RootSnapshot, bounded ViewSemanticFrame delivery, common projector, FlatProjectionCodec, and metadata columns
+M2  shared RootSession lineage, coverage/watchers, NodeId expansion, navigation, child Views, dirty edit bases, and rebase
+M3  semantic capture, NodeId extmarks, same-session provenance, ViewIntent, pure planner, and preview
+M4  synchronous write integration, global mutation gate, executor, deterministic model updates, and failure reporting
+M5  cross-filesystem identity splitting, rename-cycle hardening, symlink-root behavior, and the complete Linux/Windows matrix
 1.0 every Section 26 acceptance criterion passes
 ```
 
-The implementation sequence within those milestones is:
+The implementation sequence is:
 
-1. Establish the Cargo workspace, initial Neovim 0.12.4/`nvim-oxi` candidate, `nvim_adapter` compatibility spike, Linux/Windows build paths, local build helper, native loader, and headless Neovim harness.
-2. Implement Lua configuration capture, direct/child Instance inheritance including current-presentation snapshots, immutable resolved options, runtime presentation getters/setters, registry/name lookup, function-valued actions/keymaps, `vim.b.fred`, FileType ordering, attach callbacks, and native layout ownership records.
-3. Implement InstanceId/ViewId native registration, one-buffer-per-instance lifecycle, authoritative window reconciliation, open/hide/toggle/window transfer, inherited `cleanup.instance`, setup-only immutable groups, Hidden timers/group LRUs with capacity enforcement, and one idempotent terminal destroy/discard path.
-4. Implement canonical path algebra, reversible filename encoding, immutable Snapshot, RootSession/View state, runtime registry, and read-only flat rendering.
-5. Implement the Rust worker channel, bounded provisional and main-thread event batches, cancellation, generation checks, `AsyncHandle` notification with re-wake, and one atomic snapshot publication after every requested scope in a generation is terminal.
-6. Add baseline depth, local expansion/collapse, reference-counted coverage, ignore rules, Rust EntryFact catalog frames and sealed renderer commits, Lua `presentation` hidden-file filtering/subtree propagation/sorting, metadata columns, conditional stat fetching, presentation history resets, reveal/navigation, watcher establishment/degraded reporting, and RootSession Weak-registry/View-task ownership release.
-7. Add immutable dirty-View edit bases, namespace-only three-way rebase, overlapping RootSession invalidation, and conflict diagnostics.
-8. Add full-line range EntryId extmarks, Neovim 0.12 buffer-local `p`/`P` wrappers, `:FredNew`, edit capture, same-RootSession provenance normalization and `gp`, and directory-row descendant hiding.
-9. Implement immutable direct namespace probes including planned-parent chains, the pure planner with both revision tokens, COPY_TREE/DELETE_TREE, nested directory normalization, descendant evacuation, self-subtree rejection, replacement validation, collision checks, and cross-filesystem MOVE expansion.
-10. Build synchronous current-buffer `acwrite`/`BufWriteCmd` integration as the sole buffer-planned mutation entry, enforce Open/displayed/current-instance and exact-target-URI validation and one-Instance scope, add non-planning buffer-local `FileWriteCmd`/`FileAppendCmd` rejection handlers, generation-validate deferred post-write synchronization, and add non-confirmable diagnostics, confirmation for valid plans, stale-plan checks, and repeated direct probes in final preflight.
-11. Implement the process-global mutation lock, common post-lock finalization, deterministic model updates, serial fail-stop execution, deep platform tree operations, no-replace destinations, rename-cycle names, overlap refresh, and partial-failure reporting.
-12. Add immediate `:FredLink`, buffer-directory path resolution, and global-lock integration.
-13. Run complete instance-lifecycle, configuration, layout, FileType, action, reveal/navigation, mutation, failure-injection, multi-view, overlap, Linux/Windows, watcher, and large-tree suites before declaring version one stable.
+1. Establish the Cargo workspace, exact Neovim 0.12.4/`nvim-oxi` candidate, native module/`AsyncHandle` bridge compatibility spike, Linux/Windows build paths, local build helper, native loader, and headless Neovim harness. Rust buffer access is not part of the native bridge.
+2. Implement Lua configuration capture, direct/child inheritance, immutable resolved options, runtime presentation getters/setters, registry/name lookup, function-valued actions/keymaps, `vim.b.fred`, FileType ordering, attach callbacks, native layouts, and Instance cleanup.
+3. Implement Lua `BufferProjectionEngine`, internal sealed ProjectionCodec contract, FlatProjectionCodec, line rendering/capture, NodeId binding specs, virtual decorations, changedtick, cursor, modified state, undo baselines, and internal-sync suppression against a temporary mock semantic frame.
+4. Implement Rust RootSessionId/ViewId/NodeId allocation, canonical path algebra, session root NodeId, normalized immutable RootSnapshot, `nodes_by_id`, `children_by_parent`, path indexes, directory status, and exact-root Weak registry.
+5. Implement worker channels, bounded scan/metadata events, cancellation, generation checks, `AsyncHandle` re-wake, and one atomic RootSnapshot publication after all requested scopes are terminal.
+6. Implement Rust View with movable `root_node_id`, semantic ViewIntent, CommittedProjection, ViewSemanticFrame construction, sealed frame tokens, bounded frame events, and Lua catalog-mirror assembly.
+7. Implement Lua common projector: hidden-directory propagation, sibling-local SortSpec ordering, depth-first traversal, baseline materialization, NodeId-keyed ExpansionState, explicit includes, coverage-request generation, and Lua columns/metadata requirements.
+8. Implement exact-root and explicit parent/child/navigate RootSession sharing rules, same-session path rebasing, child subtree expansion snapshots, independent overlapping sessions, reveal, directory-symlink leaf rejection, watchers, and overlap invalidation.
+9. Add immutable dirty edit bases, semantic three-way rebase, frame-level conflict/validation nodes, clean/dirty sibling-order freeze behavior, and non-confirmable diagnostics.
+10. Add full-line Lua range extmarks, Rust NodeId allocation for unbound rows, `:FredNew`, FlatProjectionCodec semantic capture, Lua `TextYankPost`, `p`/`P` wrappers, same-session provenance, `gp`, and directory-row descendant suppression through ViewIntent.
+11. Implement immutable direct namespace probes, the pure planner with both revisions, COPY_TREE/DELETE_TREE, nested directory normalization, descendant evacuation, replacement validation, collision checks, and logical NodeId preservation.
+12. Build synchronous current-buffer `acwrite`/`BufWriteCmd` integration as the sole buffer-planned mutation entry, add `FileWriteCmd`/`FileAppendCmd` rejection handlers, Lua deferred post-write frame rendering, confirmation, stale checks, and repeated final probes.
+13. Implement the process-global mutation lock, common post-lock finalization, serial fail-stop execution, deep tree operations, no-replace destinations, rename cycles, deterministic model publication, overlap refresh, cross-filesystem success identity preservation, and copy-success/delete-failure identity splitting.
+14. Add immediate `:FredLink`, buffer-directory resolution, global-lock integration, directory-symlink target opening as a separate RootSession, and full failure-injection coverage.
+15. Run complete configuration, lifecycle, layout, buffer, projection, navigation, mutation, multi-View/session, watcher, metadata, Linux/Windows, and large-tree suites before declaring version one stable.
 
-Each phase must preserve read-only usability before mutation support is enabled.
+Each phase must preserve read-only usability before mutation support is enabled. Version one does not implement or expose a tree codec, projection toggle, renderer selector, or custom codec registration.
 
 ## 26. Acceptance Criteria
 
 Version one is ready when:
 
-1. FRED builds locally as a required Rust `cdylib` and loads on Linux and Windows for every exact allowlisted Neovim 0.12 patch-version and pinned `nvim-oxi` revision pair; every direct `nvim_adapter` call passes the pair's compatibility harness, and missing native libraries produce actionable hard errors without a fallback runtime.
-2. The Lua facade exposes `build`, `setup`, `new`, the explicit hidden-file visibility and sort getters/setters, Open/displayed `refresh` that does not require the Instance buffer to be current, registry lookups, and function-valued `actions`, with no public apply/save method, command, action, default mapping, or compatibility aliases for superseded interfaces; `:FredRefresh` remains current-buffer-only and setup validates complete presentation and cleanup configuration.
-3. `:Fred` creates an unnamed instance and opens a responsive flat `filetype=fred`, `buftype=acwrite` View of a local root.
-4. Multiple Views of one canonical root share immutable snapshots while retaining independent Lua presentation state, Rust projection reconciliation, and intent.
-5. A scan generation publishes exactly one immutable current snapshot only after all requested scopes are terminal; partial and failed scopes remain non-authoritative in that result.
-6. Dirty Views retain immutable edit-base snapshots across external namespace changes.
-7. Ignore, hidden-file display, sort, depth, expansion, collapse, scan cancellation, scan failure, scan limits, reveal, layout, and watcher gaps never imply deletion.
-8. Watcher establishment is automatic; establishment failure produces a degraded warning without globally blocking unrelated valid write-driven plans.
-9. Configured metadata columns render as aligned virtual text without changing editable path lines; FRED displays no `/NNN` ID prefix or `../` row, and built-in icon, permission, size, and timestamp columns handle unavailable metadata with placeholders.
-10. Column and Lua SortSpec requirements are fetched as the union of attached View requirements; a MetadataBatch with either a stale metadata generation or a mismatched source root revision is rejected independently, metadata-only changes never create namespace conflicts or deletion intent, and metadata sorting cannot reorder a dirty View's real lines.
-11. The RootSession registry retains Weak references while Views and active tasks retain strong references; last-View detach cancels root work with no consumers, provisional task-owned batches release promptly on cancellation, and final View/task release naturally drops the whole RootSession plus all snapshots, metadata/cache state, and watchers. Scan limits bound each requested generation but acceptance imposes no cumulative memory bound on a still-live RootSession and adds no Rust cleanup, pruning, sweeper, LRU, threshold, or eviction policy.
-12. External namespace changes refresh clean Views and rebase dirty Views within covered scope.
-13. Same-named files in different directories retain distinct EntryIds.
-14. Ordinary edits and `:FredNew file`/`:FredNew dir` create, move, rename, replace, and delete files and directories from final desired state.
-15. Every listed Neovim 0.12 pair uses buffer-local `p`/`P` wrappers that preserve normal put behavior and record only qualified same-RootSession provenance; cross-session `gp` errors and foreign or unobserved insertions remain CREATE.
-16. Source retained produces COPY; one destination with removed source produces MOVE; multiple destinations with removed source produce copies followed by source deletion.
-17. `gp` copies selected top-level entries into a directory and generates deterministic `_N` names.
-18. DELETE_TREE and COPY_TREE each appear as one logical operation without advance descendant enumeration.
-19. Removing a directory row hides unedited descendants and evacuates explicitly moved descendants before DELETE_TREE.
-20. Directory COPY_TREE and MOVE to self or a descendant are rejected.
-21. Directory MOVE emits one parent move plus only explicitly required descendant operations in conditional dependency order.
-22. Immutable planner probes and repeated final-preflight probes reject missing sources, wrong source kinds, occupied destinations, required parents neither existing nor created by the plan, unrelated planned-parent occupants, non-directory existing parents or nearest ancestors, and parent traversal through symlinks; a planned occupant vacates before replacement parent creation, which precedes every descendant installation.
-23. Destination collision never overwrites, including a destination that appears after final preflight.
-24. Only the buffer-local `BufWriteCmd` handler for an ordinary full-buffer write of the current visible Open FRED buffer enters buffer planning, and one write processes only that Instance. It rejects any target filename different from the FRED buffer URI; buffer-local `FileWriteCmd` and `FileAppendCmd` handlers always reject ranged and append writes before ordinary file I/O and never enter planning. Non-current, mismatched, or Hidden writes also fail before planning. Invalid or conflicted plans open non-confirmable diagnostics and preserve dirty edits; only valid non-empty plans open one all-or-nothing confirmation preview; an empty valid plan clears modified state without preview.
-25. Every plan carries distinct edit-base and planned-root revisions, and stale revision, changedtick, or intent-generation checks abort before mutation.
-26. Every post-lock outcome leaves Apply, processes queued refresh demand, and releases the process-global mutation lock.
-27. The global lock prevents concurrent write-driven apply pipelines or `:FredLink` across same, unrelated, and overlapping roots.
-28. Cross-filesystem file and directory MOVE executes as copy to the final destination followed by source deletion only after copy success.
-29. The executor stops on the first execution error and runs no later operation.
-30. Completed-node results update the in-memory namespace model deterministically; partial execution reports completed, failed, and unstarted operations, abandons failed/unstarted initiating-View intent, and re-renders from that model.
-31. Filesystem refresh remains best effort; refresh failure reports through Neovim without adding a special state or blocking a later current-buffer write.
-32. Successful and partially failed mutation invalidates and refreshes overlapping RootSessions on a best-effort basis.
-33. File content, permissions, size, and timestamp changes do not create FRED namespace conflicts.
-34. External rename is handled conservatively without inode/file-key identity inference.
-35. `:FredLink {from} {to}` executes immediately with buffer-directory relative resolution and exclusive destination creation; every success or failure releases the global lock, namespace-changing outcomes invalidate and refresh overlapping RootSessions on a best-effort basis before release, and a later current-buffer write or `:FredLink` can proceed.
-36. All Rust unit, Lua unit, integration, property, and headless Neovim tests pass.
-37. FRED runs without Oil installed and contains no Oil runtime dependency.
-38. A direct instance resolves setup options plus explicit options; a child defaults to the parent's current root, snapshots the parent's current hidden-file visibility and SortSpec into its immutable initial configuration, applies child overrides, and does not duplicate setup callbacks or retain a live link to later parent changes.
-39. Each live InstanceId owns at most one buffer/View, optional names are unique, root is resolved during `new()`, and resolved configuration is immutable.
-40. One instance buffer may appear in multiple windows/tabpages; `open()` focuses an existing current-tab display by default, while explicit `new_display = true` creates another display without duplicating View or RootSession state.
-41. `layout` supports buffer, float, split, vsplit, and tab through native Neovim Lua APIs without NUI or layout-specific types leaking into core Instance/View/RootSession interfaces.
-42. Borrowed windows restore prior/alternate/scratch buffers, owned displays close when safe, and FRED never deletes the final ordinary window merely to hide itself.
-43. `hide()` targets the current or explicit window, no public `close()`/hide-all exists, and `toggle()` hides all current-tab displays including floats or opens when none exist.
-44. Default directory selection creates a child instance, transfers the triggering window, preserves normal Neovim history behavior, and leaves the parent buffer available until instance cleanup.
-45. Instance lifecycle derives Created/Open/Hidden display state through authoritative window reconciliation, defers `WinClosed` reconciliation, sends validated `BufDelete`/`BufWipeout` directly to one idempotent terminal Destroyed path, and makes Lua-owned Hidden delay plus setup-defined group capacity the only OR-combined automatic destroy triggers. `Open -> Hidden` inserts newest and starts the timer when enabled; `Hidden -> Open` removes/cancels; rehide reinserts newest; overflow destroys oldest until within capacity; `capacity = 0` retains none; `delay_ms = 0` disables only the timer.
-46. A Hidden dirty buffer cannot enter the write/apply pipeline or refresh but may be reopened and then written/refreshed; `instance:refresh()` accepts any Open/displayed Instance even when non-current, while `:FredRefresh` remains current-buffer-only. Terminal Instance destruction discards unwritten text/intent, detaches its View, and releases references without executing a filesystem operation. If successful `:wq` hides the buffer and cleanup destroys it before deferred synchronization, destroy discards the generation-tagged pending projection and the synchronizer is a no-op, with no recovery or pending-destroy state. Direct and child instances inherit resolved `cleanup.instance` values, unknown groups fail during `new()`, and setup-only groups are immutable.
-47. Keymaps merge by mode/lhs, accept only functions or `false`, and built-in/custom actions share explicit `action(ctx, opts?)` context.
-48. `actions.select()` dispatches entry kinds to action functions; the default opens files normally and directories in inherited child instances.
-49. `vim.b[bufnr].fred` is complete before fixed `filetype=fred` autocmds, and users can retrieve live instances by InstanceId, name, or buffer.
-50. `on_attach` accepts a function or list, runs once per instance buffer after keymaps and FileType in setup-then-instance order, and any error destroys the partial instance and is rethrown.
-51. Reveal validates only root-relative paths, establishes exact ignore overrides and obtains ancestor/target EntryFacts before hidden classification or target projection, persistently enables hidden-file visibility when needed using the same intent-capture and history-reset transition, uses normal expansions without pinning, and never changes root.
-52. Same-instance navigation rebases the flat projection to a new current root only from a clean View; default child-instance navigation preserves dirty parent buffers.
-53. FRED has no generic temporary filter feature and runs without Oil installed or any Oil runtime dependency.
-54. Lua receives bounded catalogs containing every entry in the View-requested scopes, applies the sole hidden-file predicate with hidden-directory subtree propagation, performs the fixed single-key sort, and submits only ordered visible EntryIds without expanding coverage.
-55. Rust accepts at most one atomic `{ CatalogFrameToken, ordered_visible_ids }` submission, requires exact equality for every sealed frame identity field, rejects stale/reused tokens and unknown/duplicate IDs, accepts any unique frame-ID subset as projection absence, and preserves/deduplicates protected dirty/conflict/validation rows with stable anchors and deterministic fallback.
-56. Hidden-file visibility changes may run while dirty, use the frozen full-catalog order, preserve unapplied intent and `'modified'`, and reset undo history after every actual boolean change even when visible order is unchanged; same-value changes are no-ops. Sort changes reject dirty Views unless the normalized spec is unchanged, never create a deferred request, and reset history only after an actual clean-View real-row reorder.
-57. The public SortSpec is exactly one built-in key plus required `direction` and `case_sensitive` fields, is independently complete and wholesale-replacing at every configuration/runtime boundary, sorts missing metadata last, reverses only the primary field, keeps all tie-breakers ascending, and exposes no custom comparator, multi-key, directory-first, or configurable missing-value interface.
-58. Lua presentation work is bounded and cancellable, yields event-loop progress on large catalogs, rejects non-boolean hidden callbacks, and cancels stale presentation generations before they can submit or commit.
+1. FRED builds locally as a required Rust `cdylib` and loads on Linux and Windows for every exact allowlisted Neovim 0.12/`nvim-oxi` pair; native module registration, conversion, `AsyncHandle`, and event-delivery compatibility pass, while missing native libraries produce actionable hard errors.
+2. Rust performs no direct FRED View buffer, extmark, virtual-text, cursor, changedtick, modified-state, or undo operation.
+3. The Lua facade exposes the approved Instance, presentation, refresh, registry, and function-valued action APIs with no public apply/save method, tree mode, projection toggle, renderer selector, placeholder `view_mode`, custom codec registration, or compatibility alias.
+4. `:Fred` opens a responsive version-one FlatProjectionCodec buffer with `filetype=fred`, `buftype=acwrite`, complete View-relative paths, no `/NNN` identity prefix, and no `../` row.
+5. One RootSession-scoped NodeId type represents existing files/directories/symlinks, PendingCreate nodes, PendingCopy nodes, dirty moved nodes, and conflicted nodes; successful CREATE/COPY keeps its pending NodeId, while a unique removed-source destination normalized to MOVE is rebound to the source NodeId and retires its provisional destination NodeId.
+6. Every published RootSnapshot has one root NodeId and self-consistent `nodes_by_id`, `children_by_parent`, path index, one-parent membership, directory status, and symlink-leaf invariants.
+7. A scan generation publishes exactly one immutable RootSnapshot only after every requested scope is terminal; Complete directory membership may remove absent prior children, while Partial/Failed membership remains non-authoritative, carries prior unobserved nodes as RetainedUnverified, and cannot imply conflict, deletion, or Missing root.
+8. Exact-root direct Views share RootSession state; same-instance descendant navigation and explicit parent/child lineage share the existing RootSession and NodeIds; independent overlapping direct roots are not automatically merged.
+9. Same-instance navigation changes only View `root_node_id`, re-bases View-relative paths, preserves NodeIds and NodeId-keyed expansion, keeps the buffer/Instance/View/RootSession, and requires a clean View; a same-session MOVE of a dirty View's root NodeId follows its new path and carries desired View-relative intent with it, while only authoritative root deletion produces the non-confirmable Missing-root diagnostic and blocks planning/navigation without silent rebinding.
+10. A child Instance inside the parent session shares that RootSession, uses the selected directory NodeId as root, snapshots only parent expansion entries in that subtree, evolves independently afterward, and leaves the parent dirty buffer intact.
+11. A directory symlink remains a symlink leaf with no children, cannot be expanded inline, and affects only the link under rename/copy/delete; explicit target opening uses a separate exact-root RootSession.
+12. Rust applies RootSnapshot plus ViewIntent into a projection-neutral ViewSemanticFrame containing normalized parent/child membership for clean, dirty, pending, moved, conflict, validation, suppressed, and evacuated state.
+13. ViewSemanticFrame events are bounded and token-bound; Lua rejects stale or mixed frame batches.
+14. Lua assembles a catalog mirror, applies hidden-directory filtering, sorts only direct sibling groups, performs depth-first traversal, and keeps every materialized directory subtree contiguous.
+15. Flat and a test-only tree-shaped codec fixture consume the same ProjectedRow NodeId order; only line encoding/decoding differs.
+16. Version one implements only the internal sealed FlatProjectionCodec and exposes no public renderer extension seam.
+17. Lua BufferProjectionEngine owns full-line NodeId range extmarks, rendering/capture, decorations, cursor reconciliation, changedtick, modified state, undo baselines, and internal-sync suppression.
+18. Unbound rows receive Rust-allocated NodeIds before semantic capture; duplicate, unknown, foreign-session, or stale bindings are rejected.
+19. Lua semantic capture submits only NodeId, desired View-relative path candidate, kind, optional same-session `copy_from`, projection revision, and changedtick; Rust repeats path and semantic validation and never parses buffer text.
+20. Rust records CommittedProjection from a current ViewFrameToken, unique ordered NodeIds, and changedtick; only removal of a bound Existing NodeId from that projection may generate deletion intent.
+21. Ignore, hidden-file display, sibling sort, depth, expansion, collapse, renderer choice, scan cancellation/failure/limits, reveal, layout, and watcher gaps never imply deletion.
+22. `TextYankPost` and Lua `p`/`P` wrappers preserve native behavior, qualify register content/type, attach provenance only within one RootSession, and treat unqualified or foreign insertions as PendingCreate.
+23. Parent/child Views sharing one RootSession may exchange provenance; independent overlapping sessions may not.
+24. Source retained produces COPY/COPY_TREE; one destination with removed source produces MOVE and rebinds its provisional destination identity to the source NodeId; multiple destinations with removed source retain destination NodeIds, produce copies, then delete the source.
+25. `gp` copies selected top-level entries into a directory and generates deterministic `_N` destinations.
+26. Dirty Views retain immutable edit bases; external namespace changes refresh clean Views and semantically rebase dirty Views without overwriting intent.
+27. Metadata columns are Lua virtual text, never editable syntax, handle unavailable values with placeholders, and request only required Rust metadata fields.
+28. Metadata batches independently reject stale metadata generation, source RootRevision, NodeId, or observed path; metadata changes never create namespace conflict or deletion intent.
+29. Metadata-backed sorting may reorder only clean sibling groups; dirty Views freeze real sibling orders while virtual columns continue to refresh.
+30. Watcher establishment is automatic; failure is visible but does not globally block unrelated valid plans.
+31. RootSession Weak registry entries do not retain sessions; Views/tasks do, last-View detach cancels work with no consumers, and final strong-reference release drops snapshots, caches, coverage, metadata, and watchers without a Rust LRU or sweeper.
+32. Ordinary edits and `:FredNew file`/`:FredNew dir` express create, move, rename, replace, and delete from final desired state.
+33. DELETE_TREE and COPY_TREE each remain one logical operation without advance descendant enumeration.
+34. Removing a directory row suppresses unedited descendants in ViewSemanticFrame and evacuates explicitly moved descendants before DELETE_TREE.
+35. Directory COPY_TREE and MOVE to self or a descendant are rejected.
+36. Directory MOVE emits one parent move plus only required descendant operations in conditional dependency order.
+37. Direct namespace probes and repeated final preflight reject missing sources, wrong kinds, occupied destinations, missing/unplanned parents, unrelated planned-parent occupants, non-directory ancestors, and parent traversal through symlinks.
+38. Destination creation uses exclusive/no-replace behavior and never overwrites, including races after final preflight.
+39. Only ordinary full-buffer write of the current visible Open FRED buffer through Lua `BufWriteCmd` enters planning; one write processes one Instance and exact private URI.
+40. Buffer-local `FileWriteCmd` and `FileAppendCmd` reject ranged/append writes before ordinary I/O and never capture or plan.
+41. Invalid or conflicted captures show non-confirmable diagnostics and preserve dirty edits; valid non-empty plans show one all-or-nothing confirmation; valid empty plans synchronize cleanly without preview.
+42. Every plan carries edit-base revision, planned-root revision, intent generation, and changedtick; stale values abort before mutation.
+43. One process-global mutation lock covers every write-driven apply and `:FredLink` across same, unrelated, and overlapping sessions.
+44. Every post-lock outcome leaves Apply, processes queued refresh demand, and releases the lock.
+45. Execution is serial and fail-stop; no node runs after the first failure and no automatic retry or rollback occurs.
+46. Same-filesystem MOVE and fully successful cross-filesystem MOVE retain the source NodeId at destination.
+47. Cross-filesystem copy success followed by source-delete failure retains the source NodeId and allocates a distinct destination NodeId; failed partial COPY_TREE discoveries use new NodeIds.
+48. Completed execution effects deterministically update the in-memory namespace model; failed/unstarted initiating intent is abandoned after execution begins; completed/failed/unstarted results are reported.
+49. Successful and partially successful mutation invalidates overlapping RootSessions and queues best-effort refresh; refresh failure reports without introducing a recovery or apply-blocking state.
+50. `:FredLink` resolves relative paths against the buffer directory, creates exclusively, uses the global lock, treats directory symlinks as leaves in existing sessions, refreshes overlapping sessions when needed, and always releases the lock.
+51. One Instance owns at most one buffer/View while one buffer may appear in multiple windows/tabpages; layouts remain native Lua concerns.
+52. Created/Open/Hidden/Destroyed lifecycle, display reconciliation, borrowed/owned layout behavior, cleanup timers, group LRUs, capacity zero, delay zero, and one idempotent terminal destroy path pass.
+53. Hidden dirty buffers may be reopened and written before cleanup; terminal destroy discards text/intent without filesystem mutation; stale deferred Lua synchronization becomes a no-op.
+54. `vim.b[bufnr].fred`, fixed FileType, keymaps, FileType callbacks, setup/instance `on_attach`, registry lookup, and fail-fast attach rollback preserve their documented order.
+55. Reveal obtains required ancestor/target semantic facts before classification, applies precise ignore overrides, persistently enables hidden visibility when needed, uses normal NodeId expansions, and never changes root.
+56. All Rust unit, Lua unit, integration, property, and headless Neovim tests pass, FRED runs without Oil, and no Oil runtime dependency exists.
 
 ## 27. Residual Risks
 
@@ -2245,15 +2378,18 @@ Version one is ready when:
 - Retained immutable snapshots increase memory use while dirty Views or active tasks hold strong references; version one relies on ordinary ownership release rather than a separate memory-budget eviction policy.
 - A long-lived RootSession may cumulatively retain namespace and metadata cache for scopes visited by earlier generations even after current View coverage moves elsewhere. Per-generation scan limits do not bound that total; all retained cache is guaranteed to release only when the final View/task references release the whole RootSession.
 - Metadata columns and metadata-backed Lua sorting add stat calls and platform-specific normalization cost, especially for large covered roots.
-- Lua mirrors each View's bounded entry catalog and classification cache, increasing main-thread work, memory use, and garbage-collection pressure at large coverage limits.
-- A slow or failing `is_hidden_file` callback can delay or abort a presentation transaction; its exception is intentionally exposed directly by Neovim.
-- Actual hidden-file visibility changes intentionally reset Neovim undo history even when visible rows do not change; clean sort changes reset history only when real-row order changes; unapplied intent survives either reset, but earlier text undo steps do not.
+- Lua mirrors each View's bounded ViewSemanticFrame catalog, child membership, ProjectedRows, bindings, and classification cache, increasing main-thread work, memory use, and garbage-collection pressure at large coverage limits.
+- A slow or failing `is_hidden_file` callback, common projector, FlatProjectionCodec, or ProjectionCommit can delay or abort presentation; errors are intentionally fail-fast and version one adds no renderer rollback or recovery state.
+- Actual hidden-file visibility changes intentionally reset Neovim undo history even when visible rows do not change; clean sibling-sort changes reset history only when real-row order changes; unapplied semantic intent survives either reset, but earlier text undo steps do not.
 - A failed or unavailable stat may leave a placeholder until the next metadata refresh; it must never be interpreted as a missing namespace entry.
 - Extmark and provenance behavior under complex edits requires headless and property testing.
-- `nvim-oxi` couples the native build to the exact Neovim 0.12 patch-version/revision pairs listed in build configuration; every new pair requires an explicit `nvim_adapter` compatibility run and may require a rebuild.
+- `nvim-oxi` couples the native build to the exact Neovim 0.12 patch-version/revision pairs listed in build configuration; every new pair requires an explicit native module/`AsyncHandle` bridge compatibility run and may require a rebuild.
 - Opening many windows for one instance increases Neovim window/UI cost even though scan and snapshot data remain shared.
 - Hidden dirty instances may be destroyed by either `cleanup.instance.delay_ms` or their cleanup group's capacity overflow; unwritten edits are intentionally lost at that point, and `capacity = 0` makes hiding immediately terminal.
 - Native jumplist/alternate-buffer behavior depends on normal Neovim window buffer switching and is not supplemented by a Fred history stack.
+- Exact-root and explicit lineage sharing means one RootSession may serve Views rooted at different descendant NodeIds; path rebasing, coverage reference counting, and root-node deletion/move cases require dedicated tests.
+- Directory symlink targets intentionally open as separate RootSessions, so expansion, NodeId, intent, and provenance do not cross that boundary automatically.
+- Version one proves the projection-neutral boundary only with FlatProjectionCodec; a future editable tree codec will still require its own indentation/parent reconstruction, invalid-layout, cut/put, dirty-switch, and undo tests even though Rust types and planner remain unchanged.
 - User `on_attach`, keymap, hidden-file, and custom action callbacks execute inside Neovim and may fail or introduce user-side latency.
 
 These risks are explicit constraints. The design favors a small namespace planner, direct platform operations, one global mutation gate, serial fail-stop execution, and best-effort refresh over complex guarantees for rare interruption scenarios.
