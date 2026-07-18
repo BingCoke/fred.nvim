@@ -2,7 +2,7 @@
 
 **Status:** Accepted direction; implementation pending
 **Date:** 2026-07-15
-**Last revised:** 2026-07-17
+**Last revised:** 2026-07-18
 **Project:** `fred.nvim`
 **Expansion:** Filesystem Representation Editor
 
@@ -12,9 +12,9 @@ FRED is a buffer-native file browser for Neovim. It projects selected parts of a
 
 FRED is independent. It does not depend on, integrate with, or call Oil. It may borrow general ideas such as editable directory buffers, entry identity, asynchronous rendering, operation planning, and confirmation before mutation, but it owns its scanner, snapshots, views, planner, executor, watcher integration, and user interface.
 
-FRED uses a required Rust `cdylib` built locally by the user or plugin manager. The filesystem core is Rust-first and uses `nvim-oxi` for native module integration, immutable namespace snapshots, session-scoped `NodeId` identity, scanning, metadata, intent, conflict handling, planning, and execution. Rust never reads or writes a FRED View buffer and does not know whether Lua presents a flat or tree UI. Rust combines each RootSession snapshot with per-View intent into a projection-neutral, tree-shaped `ViewSemanticFrame`. Lua owns the stable Instance facade, resolved configuration, actions, keymaps, attach callbacks, registry lookup, native Neovim layouts, lifecycle autocmds, Instance cleanup timers and hidden-group LRUs, materialization and presentation state, sibling-local sorting, the common projector, the buffer projection engine, range extmarks, metadata decorations, cursor/undo behavior, yank/put provenance, and bidirectional projection codecs. Version one ships only the internal flat codec. Rust RootSession lifetime follows ordinary strong/weak ownership rather than policy-driven retention or eviction. FRED supports only explicitly validated Neovim 0.12 patch-version and pinned `nvim-oxi` revision pairs. It does not publish precompiled binaries or provide a pure-Lua fallback.
+FRED uses a required Rust `cdylib` built locally by the user or plugin manager. The filesystem core is Rust-first and uses `nvim-oxi` for native module integration, immutable namespace snapshots, session-scoped `NodeId` identity, scanning, metadata, intent, conflict handling, planning, and execution. Rust never reads or writes a FRED View buffer and does not know whether Lua presents a flat or tree UI. Rust combines each RootSession snapshot with per-View intent into a projection-neutral, tree-shaped `ViewSemanticFrame`. Lua owns the stable Instance facade, resolved configuration, actions, keymaps, attach callbacks, registry lookup, native Neovim layouts, lifecycle autocmds, Instance cleanup timers and hidden-group LRUs, materialization and presentation state, sibling-local sorting, the common projector, the internal flat projection encoder/decoder, the single `BufferRuntime` buffer owner, range extmarks, metadata decorations, cursor/undo behavior, and yank/put provenance. Version one does not define a general projection interface. Rust RootSession lifetime follows ordinary strong/weak ownership rather than policy-driven retention or eviction. FRED supports only explicitly validated Neovim 0.12 patch-version and pinned `nvim-oxi` revision pairs. It does not publish precompiled binaries or provide a pure-Lua fallback.
 
-The version-one renderer is a flat list of complete View-relative paths. It is not an indented tree, sidebar, or connector-glyph hierarchy. A View may materialize different directories to different depths while every displayed line remains a complete path. This is a Lua rendering contract rather than a Rust namespace limitation: Rust supplies the same `ViewSemanticFrame` and parent/child membership that a future built-in tree codec would consume. Version one exposes no tree mode, projection toggle, placeholder `view_mode`, public custom renderer, or projection-backend registration API.
+The version-one renderer is a flat list of complete View-relative paths. It is not an indented tree, sidebar, or connector-glyph hierarchy. A View may materialize different directories to different depths while every displayed line remains a complete path. This is a Lua rendering contract rather than a Rust namespace limitation: Rust supplies the same `ViewSemanticFrame` and parent/child membership that a future built-in tree projection would consume. Version one exposes no tree mode, projection toggle, placeholder `view_mode`, public custom renderer, or projection-backend registration API. A general projection interface is introduced only when a second built-in projection actually exists.
 
 Example buffer for `/home/user/project`:
 
@@ -31,6 +31,10 @@ tests/
 The product description is:
 
 > FRED is a buffer-native file browser for Neovim. Browse files, edit the filesystem.
+
+### 1.1 Normative Ownership And Precedence
+
+Sections 5, 10, 14, 17, and 20 are the normative sources for invariants, data ownership, planning, mutation, and module boundaries. User-experience, error-handling, testing, implementation-sequence, and acceptance sections reference those contracts and must not redefine a second state machine or authority model. When repeated explanatory text appears to conflict, the normative ownership and protocol definitions win and the duplicate text must be corrected rather than implemented as another path.
 
 ## 2. Goals
 
@@ -61,14 +65,14 @@ FRED must:
 23. Let one instance own one editable buffer while displaying that buffer in multiple windows and sharing RootSession data by reference.
 24. Let users create named or unnamed instances, inherit configuration, choose action functions per keymap mode, and reveal files through normal flat expansion.
 25. Destroy Hidden instances through exactly two Lua-owned, OR-combined triggers: their per-instance hidden delay and their setup-defined cleanup-group LRU capacity, while discarding only unapplied buffer state and never mutating the filesystem.
-26. Keep the Rust/Lua data path projection-neutral: Rust publishes semantic nodes and parent/child membership, Lua produces one common depth-first `ProjectedRow` sequence, and only the internal Lua codec determines editable line syntax.
+26. Keep the Rust/Lua data path projection-neutral: Rust publishes semantic nodes and parent/child membership, Lua produces one common depth-first `ProjectedRow` sequence, and the internal flat encoder/decoder alone determines version-one editable line syntax.
 
 ## 3. Non-Goals For Version One
 
 Version one will not:
 
 - depend on or interoperate with Oil;
-- ship an indented-tree renderer, flat/tree toggle, connector-glyph hierarchy, permanent sidebar layout, placeholder projection-mode option, or public custom projection codec;
+- ship an indented-tree renderer, flat/tree toggle, connector-glyph hierarchy, permanent sidebar layout, placeholder projection-mode option, runtime projection interface, or public custom projection extension;
 - recursively follow directory symlinks;
 - support SSH, S3, archives, containers, or other remote backends;
 - expose a public backend registration interface;
@@ -114,12 +118,12 @@ The only buffer-planned filesystem mutation entrypoint is the user's ordinary wr
 The internal write pipeline has exactly two native stages:
 
 1. Lua captures the current semantic rows and calls `apply_prepare(view_handle, CaptureRequest)`. Rust validates and records normalized ViewIntent, performs the initial immutable direct namespace probes, and calls the pure Planner.
-2. A rejected capture or plan returns non-confirmable diagnostics. A valid plan returns one sealed, opaque, one-shot `PreparedApply` capability containing the immutable `ValidPlan`, including Planner-owned affected paths and final-probe expectations, plus its authority stamps. A non-empty plan also returns a sanitized logical preview; an empty plan returns no preview.
-3. Lua displays the complete non-empty preview and asks for one all-or-nothing confirmation. Preview cancellation calls `apply_finish(prepared, Cancel)` or drops the capability, acquires no mutation lock, performs no filesystem action, and preserves the dirty buffer and ViewIntent.
-4. For a confirmed non-empty plan, or immediately for an empty plan, Lua establishes its `ApplyBufferGuard`, prevents reentrant writes and new ordinary edits, reads the observed changedtick and write epoch, and calls `apply_finish(prepared, Execute { observed_changedtick, write_epoch })`.
-5. `apply_finish` consumes the capability exactly once. Replay, duplicate finish, a foreign capability, or a previously dropped capability is rejected. Before an already-requested execution cancellation may abandon intent, Apply upgrades the initiating handles and validates current View ownership plus the sealed View/root/projection/edit-base/planned-root/intent/changedtick authority and execute witness. A stale old capability returns a pre-execution stale error and preserves newer intent.
-6. For a current non-empty Execute without an already-observed cancellation, Apply acquires the process-global mutation lock, registers the `ValidPlan`'s affected paths in the process-wide active mutation fence, invalidates existing overlapping scan generations, repeats direct namespace probes under the lock, and invokes the serial Executor only when every check succeeds. A current cancellation observed after authority validation may instead take the clean path before the gate or first syscall. Existing and newly created RootSessions consult the active fence at scan start and publication. An empty plan performs the same authority/witness checks without acquiring the mutation gate, registering a fence, or invoking Executor.
-7. Every empty-plan, successful, execution-failed, or accepted execution-cancelled outcome that produces a clean semantic frame is synchronously rendered and committed by Lua with `'modified' = false` before `BufWriteCmd` returns. Success and empty plans then return write success; execution failure and cancellation return write failure so `:wq` remains open. Only best-effort refresh and ancillary UI work are deferred. Every terminal or abort path releases `ApplyBufferGuard`.
+2. A rejected capture or plan returns non-confirmable diagnostics. A valid plan returns one sealed, opaque, one-shot `PreparedApply` capability containing the immutable `ValidPlan`, including Planner-owned affected paths and final-probe expectations, plus one immutable `ApplyAuthorityStamp`. A non-empty plan also returns a sanitized logical preview; an empty plan returns no preview.
+3. Lua displays the complete non-empty preview and asks for one all-or-nothing confirmation. Preview cancellation drops the capability, acquires no mutation lock, performs no filesystem action, and preserves the dirty buffer and ViewIntent.
+4. For a confirmed non-empty plan, or immediately for an empty plan, Lua establishes its Lua-owned `ApplyBufferGuard`, prevents reentrant writes and new ordinary edits, records a Lua-local `write_epoch`, reads `observed_changedtick`, and calls `apply_finish(prepared, Execute { observed_changedtick })`. Rust never interprets or validates `write_epoch`; Lua uses it only when accepting the terminal result.
+5. `apply_finish` consumes the capability exactly once. Replay, duplicate finish, a foreign capability, or a previously dropped capability is rejected. Before an already-requested execution cancellation may abandon intent, Apply upgrades the initiating handles and compares the sealed `ApplyAuthorityStamp` with current Rust View/root/projection state plus `observed_changedtick`. A stale old capability returns a pre-execution stale error and preserves newer intent.
+6. A current cancellation observed before gate acquisition performs a View-only clean cancellation: under the current View/RootSession state lock, Rust revalidates `ApplyAuthorityStamp`, clears the initiating ViewIntent, and builds a clean frame from that same current RootSnapshot without publishing a RootSnapshot, registering a mutation fence, or invoking Executor. A valid empty plan uses the same View-only synchronization. For a current non-empty Execute that proceeds, Apply acquires the process-global mutation lock, registers the `ValidPlan` affected paths in the process-wide active mutation fence, invalidates existing overlapping scan generations, revalidates `ApplyAuthorityStamp` after fencing, repeats direct namespace probes under the lock, and invokes the serial Executor only when every check succeeds. Existing and newly created RootSessions consult the active fence at scan start and publication.
+7. Every empty-plan, successful, execution-failed, or accepted execution-cancelled outcome that produces a clean result returns one sealed `TerminalProjection` containing the clean frame, authoritative NodeId transitions, outcome, and expected changedtick. Lua synchronously validates its local `ApplyBufferGuard.write_epoch`, consumes that terminal projection exactly once, renders and commits it with `'modified' = false`, and releases the guard before `BufWriteCmd` returns. Success and empty plans then return write success; execution failure and cancellation return write failure so `:wq` remains open. Only best-effort refresh and ancillary UI work are deferred.
 
 No public Instance apply/save method, apply action, apply command, or default apply mapping exists. The sealed capability, execution task handle, cancellation token, and Apply pipeline are internal implementation details and do not create another mutation entrypoint. `:FredLink` is the sole immediate mutation helper outside buffer write and uses the same process-global mutation runner and finalization path.
 
@@ -127,7 +131,7 @@ No public Instance apply/save method, apply action, apply command, or default ap
 
 An entry absent from the current buffer because of ignore rules, Lua hidden-file filtering, Lua sorting, baseline depth, local collapse, scan limits, scan cancellation, scan failure, or missing watcher coverage remains part of filesystem state.
 
-After Lua synchronously renders a `ViewSemanticFrame`, it commits the frame token, ordered visible `NodeId` sequence, and resulting changedtick. Rust validates frame currency, membership, and uniqueness and records a `CommittedProjection`. A node omitted from the current frame or projection because of ignore rules, hidden-file filtering, materialization, collapse, scan status, or presentation policy remains projection absence. Only an existing NodeId that belonged to the initiating `CommittedProjection` and is absent from Lua's later semantic capture can generate removal intent. Dirty, pending, conflict, and validation state is already applied by Rust when it builds the next `ViewSemanticFrame`; Lua does not infer filesystem deletion from catalog omission. Metadata columns are projection-only: a missing, stale, or failed metadata value cannot create, remove, rename, or delete intent.
+After Lua synchronously renders a `ViewSemanticFrame`, it commits the frame token, ordered visible `NodeId` sequence, and resulting changedtick. Rust validates frame currency, membership, and uniqueness, then records a `CommittedProjection` containing the visible NodeId set rather than retaining presentation order. A node omitted from the current frame or projection because of ignore rules, hidden-file filtering, materialization, collapse, scan status, or presentation policy remains projection absence. Only an existing NodeId that belonged to the initiating `CommittedProjection` and is absent from Lua's later semantic capture can generate removal intent. Dirty, pending, conflict, and validation state is already applied by Rust when it builds the next `ViewSemanticFrame`; Lua does not infer filesystem deletion from catalog omission. Metadata columns are projection-only: a missing, stale, or failed metadata value cannot create, remove, rename, or delete intent.
 
 ### 5.3 Path Is Not Identity
 
@@ -173,7 +177,7 @@ FRED plans from the final captured buffer state, not from the sequence of editin
 
 Execution nodes run serially in dependency order. The first failed system call stops the batch immediately. An accepted execution-time cancellation stops at the next safe checkpoint, except that a request observed only after the final execution node has successfully completed is classified as Success. Later nodes are not run, completed effects remain, and FRED does not automatically retry or reverse them. A blocking system call that cannot be interrupted may finish before cancellation is observed.
 
-System API success is trusted. Known successful effects, including successful internal steps of a failed or cancelled compound node, are applied deterministically to the in-memory namespace model before the initiating View is synchronously re-rendered for a clean outcome. Failure reports `COMPLETED / FAILED / UNSTARTED`; cancellation reports `COMPLETED / CANCELLED / UNSTARTED`. Filesystem refresh is best effort, and neither outcome adds a journal, rollback, recovery, unknown-state, or apply-blocking state machine.
+System API success is trusted. Known successful effects, including successful internal steps of a failed or cancelled compound node, are applied deterministically to the in-memory namespace model before the initiating View is synchronously re-rendered for a clean outcome. When a failed or cancelled syscall or compound step may have left unreported namespace effects, Snapshot marks its affected directory scopes `Partial` and carries prior unverified members as `RetainedUnverified` until a later scan or direct probe confirms them; this reuses the ordinary degraded-coverage model and does not create a recovery or apply-blocking state. Failure reports `COMPLETED / FAILED / UNSTARTED`; cancellation reports `COMPLETED / CANCELLED / UNSTARTED`. Filesystem refresh remains best effort.
 
 ### 5.10 Instance Destruction Discards Only Unapplied Buffer State
 
@@ -228,7 +232,7 @@ Rust owns:
 - Rust Views identified by `ViewId`, each with a movable `root_node_id`, immutable edit base, semantic `ViewIntent`, conflict/validation state, and `CommittedProjection`;
 - application of `ViewIntent` to a snapshot to produce a projection-neutral, tree-shaped `ViewSemanticFrame` containing clean, dirty, pending, moved, conflict, and validation nodes;
 - scanning, metadata collection, watching, direct namespace probes, the pure Planner, the serial Executor, deterministic known-effect publication, overlap invalidation, and the process-global mutation gate;
-- the deep internal `apply` module, which owns `apply_prepare`/`apply_finish`, sealed `PreparedApply` capabilities, authority checks, execution cancellation coordination, the process-wide active mutation affected-path fence, common post-lock finalization, and refresh scheduling;
+- the process-level `mutation` module, which owns MutationCoordinator, `apply_prepare`/`apply_finish`, sealed `PreparedApply` capabilities, `ApplyAuthorityStamp`, `TerminalProjection`, execution cancellation coordination, the active affected-path fence, common post-lock finalization, and refresh scheduling;
 - bounded frame events, generic worker-task cancellation/transport, generation checks, and main-thread event notification.
 
 Lua owns:
@@ -238,38 +242,42 @@ Lua owns:
 - the public Instance object and live-instance registry lookups;
 - action functions, mode-grouped buffer-local keymaps, FileType metadata, and `on_attach`;
 - native Neovim layout construction, window ownership, open/hide/toggle/focus behavior, highlight definitions, lifecycle autocmds, and all Instance cleanup timers/group LRUs;
-- per-Instance materialization and expansion state, per-View catalog mirrors, hidden-file classification, sibling-local sorting, depth-first traversal, columns, and the common projector;
-- the internal `ProjectionCodec` boundary, with only `FlatProjectionCodec` implemented in version one;
-- every FRED buffer projection operation: line rendering and capture, full-line range extmarks, virtual text, cursor reconciliation, changedtick reads, `'modified'`, undo-baseline resets, internal-sync suppression, `ApplyBufferGuard`, preview/confirmation UI, execution-progress cancellation requests, and synchronous clean outcome commits; and register-qualified provenance integration through the separate `ProvenanceStore`: `TextYankPost`, `p`/`P` wrappers, register snapshots, and inserted-range qualification.
+- per-Instance materialization and expansion state, per-View catalog mirrors, hidden-file classification, sibling-local sorting, depth-first traversal, columns, the common projector, and the internal flat encoder/decoder; version one defines no general projection interface;
+- one `BufferRuntime` per Instance as the sole owner of every FRED buffer projection operation: line rendering and capture, full-line range extmarks, virtual text, cursor reconciliation, changedtick reads, Lua-local write epochs, `'modified'`, undo-baseline resets, internal-sync suppression, `ApplyBufferGuard`, preview/confirmation UI, execution-progress cancellation requests, and one-shot joint `TerminalProjection` consumption; and register-qualified provenance integration through the separate `ProvenanceStore`: `TextYankPost`, `p`/`P` wrappers, register snapshots, and inserted-range qualification.
 
-The forward boundary passes opaque RootSession/View/Node handles and bounded generation-tagged `ViewSemanticFrame` events. Lua builds one ordered `ProjectedRow` sequence, synchronously renders it, and submits a `ProjectionCommitRequest { frame_token, ordered_node_ids, changedtick }`. The reverse boundary passes semantic capture through `apply_prepare` and returns either diagnostics or a sealed `PreparedApply` plus an optional sanitized preview. Lua cannot inspect or modify the plan. After confirmation, `apply_finish` consumes that same capability with an observed changedtick/write-epoch witness; the running task exposes only generic internal progress and cancellation plumbing. Rust never parses line syntax or receives extmark positions, indentation, connectors, or cursor positions. Lua never creates filesystem operations, and Rust never executes user callbacks or directly reads or writes a FRED View buffer.
+The forward boundary passes opaque RootSession/View/Node handles and bounded generation-tagged `ViewSemanticFrame` events. Lua builds one ordered `ProjectedRow` sequence, synchronously renders it, and submits a `ProjectionCommitRequest { frame_token, ordered_node_ids, changedtick }`; Rust persists only the validated visible NodeId set. The reverse boundary passes semantic capture through `apply_prepare` and returns either diagnostics or a sealed `PreparedApply` plus an optional sanitized preview. Lua cannot inspect or modify the plan. After confirmation, `apply_finish` consumes that same capability with `observed_changedtick`; Rust validates one sealed `ApplyAuthorityStamp`, while Lua retains sole authority over its local `write_epoch`. A clean terminal outcome is returned as one sealed `TerminalProjection`. The running task exposes only generic internal progress and cancellation plumbing. Rust never parses line syntax or receives extmark positions, indentation, connectors, cursor positions, or Lua write epochs. Lua never creates filesystem operations, and Rust never executes user callbacks or directly reads or writes a FRED View buffer.
 
-### 6.4 Background Work And Task State
+### 6.4 Background Work And Mutation Coordination
 
 Version one does not use Tokio or a general-purpose asynchronous runtime.
 
-Each RootSession is in one of three conceptual states:
+A RootSession owns only optional scan/metadata tasks and their generations; it has no `Apply` state. One process-level `MutationCoordinator` is the sole authority for mutation state:
 
 ```text
-Idle
-Scan
-Apply
-```
+MutationCoordinator = Idle
+                    | Running {
+                        affected_paths,
+                        cancellation,
+                        queued_refresh
+                      }
 
-`Idle` means no RootSession filesystem task is running. `Scan` covers ordinary browse, expansion, and refresh scans. `Apply` begins only when a current non-empty Execute path acquires the process-global mutation lock; preparation, preview, pre-gate cancellation, and empty-plan synchronization do not enter Apply.
+RootSessionTaskState = Idle
+                     | Scan { generation, cancellation }
+```
 
 Rules:
 
 - a newer ordinary scan request may cancel and replace an older scan generation;
 - `apply_prepare` performs capture validation, initial probes, and pure planning without acquiring the mutation lock or changing RootSession task state;
-- after current Execute authority is validated and the global gate is acquired, Apply registers the immutable `ValidPlan` affected paths in one process-wide active mutation fence before enumerating RootSessions or issuing the first syscall;
-- every existing overlapping RootSession generation is invalidated, and any RootSession created later must consult the active fence at scan start and publication; an overlapping scan request is queued or cancelled, and no overlapping candidate may publish until the fence is removed;
-- scan events from obsolete or fenced generations are ignored, and no candidate begun before or during the fence may publish across the mutation;
-- watcher events received during Apply are coalesced for the post-apply refresh;
+- a current accepted cancellation before gate acquisition clears only the initiating ViewIntent and builds a clean frame from the current RootSnapshot under View/RootSession state synchronization; it publishes no RootSnapshot and creates no mutation state;
+- after current Execute authority is validated and the global gate is acquired, MutationCoordinator registers the immutable `ValidPlan` affected paths in one process-wide active mutation fence before enumerating RootSessions or issuing the first syscall;
+- every existing overlapping RootSession generation is invalidated, any RootSession created later consults the active fence at scan start and publication, and Apply revalidates its sealed authority after fencing before final preflight;
+- an overlapping scan request is queued or cancelled, no overlapping candidate may publish until the fence is removed, and obsolete or fenced generations are ignored;
+- watcher events received while MutationCoordinator is Running are coalesced for post-terminal refresh;
 - the execute task exposes its existing internal cancellation handle to Lua progress UI without creating a public apply/save entrypoint;
-- stale authority wins over an already-requested execution cancellation: only a current accepted Execute may abandon intent and clean-sync before the gate or first syscall;
+- stale authority wins over an already-requested execution cancellation: only a current accepted Execute may abandon intent and clean-sync;
 - execution cancellation is cooperative and checked before nodes and at safe checkpoints in long tree operations; a request observed only after the final node succeeds is Success;
-- every post-lock outcome, including final-preflight failure, execution error, and execution cancellation, leaves Apply through one common finalization path that coalesces and schedules queued refresh demand before removing the active affected-path fence and releasing the global mutation lock;
+- every post-lock outcome, including authority revalidation failure, final-preflight failure, execution error, and execution cancellation, leaves the process-level coordinator through one common finalization path that coalesces and schedules queued refresh demand before removing the active affected-path fence and releasing the global mutation lock;
 - another FRED buffer write or `:FredLink` receives a Busy error while the global mutation lock is held.
 
 Long work uses:
@@ -591,7 +599,7 @@ Attach callbacks are fail-fast. The first callback error stops later callbacks, 
 
 ### 7.6 Buffer Syntax And Canonical Path Encoding
 
-Version one's internal `FlatProjectionCodec` encodes each editable line as exactly one canonical path relative to the current View root. Rust never parses this syntax: Lua's buffer projection engine decodes edited lines into semantic rows containing NodeId, desired path candidate, kind, and optional provenance, and Rust repeats canonical path validation before updating View intent.
+Version one's internal flat projection encoder writes each editable line as exactly one canonical path relative to the current View root. Rust never parses this syntax: Lua `BufferRuntime` decodes edited lines into semantic rows containing NodeId, desired path candidate, kind, and optional provenance, and Rust repeats canonical path validation before updating View intent.
 
 ```text
 README.md
@@ -624,7 +632,7 @@ FRED does not indent entries or draw connector glyphs. Directories and descendan
 
 FRED borrows the useful shape of Oil's column registry and column specifications, while keeping its own flat path-list model. The reference implementation is Oil's [`columns.lua`](https://github.com/stevearc/oil.nvim/blob/b73018b75affd13fa38e2fc94ef753b465f770d7/lua/oil/columns.lua) and [`oil-columns` documentation](https://github.com/stevearc/oil.nvim/blob/b73018b75affd13fa38e2fc94ef753b465f770d7/doc/oil.txt#L412-L494). FRED does not copy Oil runtime code or depend on Oil.
 
-The editable buffer line remains exactly one encoded View-relative path. Lua renders columns as Neovim extmark virtual text at byte column zero with `virt_text_pos = "inline"`; they are not inserted into the buffer line, are not returned by the codec as path text, and cannot be mistaken for a path component. The path is always the final visible field. NodeId remains in a Lua-owned full-line range-extmark binding and is never rendered as editable text.
+The editable buffer line remains exactly one encoded View-relative path. Lua renders columns as Neovim extmark virtual text at byte column zero with `virt_text_pos = "inline"`; they are not inserted into the buffer line, are not returned by the flat decoder as path text, and cannot be mistaken for a path component. The path is always the final visible field. NodeId remains in a Lua-owned full-line range-extmark binding and is never rendered as editable text.
 
 The initial built-in columns are:
 
@@ -682,7 +690,7 @@ ColumnDefinition {
 }
 ```
 
-Version one registers only built-in Lua columns; it does not expose a public custom-column, renderer, projection-codec, or backend registration API. Column definitions do not parse mutable path text. Rust only collects the metadata fields requested by attached Views and returns normalized values in semantic frame nodes.
+Version one registers only built-in Lua columns; it does not expose a public custom-column, renderer, projection interface, or backend registration API. Column definitions do not parse mutable path text. Rust only collects the metadata fields requested by attached Views and returns normalized values in semantic frame nodes.
 
 Each column definition declares the metadata it needs. `icon` and `type` use already-known entry kind; `permissions`, `size`, and time columns request stat metadata. Lua's current SortSpec separately declares the one sort field it needs. A RootSession requests the union of metadata fields required by attached View columns and Lua presentation states, just as coverage is the union of their directory scopes. This follows Oil's on-demand `require_stat` approach in [`files.lua`](https://github.com/stevearc/oil.nvim/blob/b73018b75affd13fa38e2fc94ef753b465f770d7/lua/oil/adapters/files.lua#L50-L225). Metadata failures render a placeholder and a non-blocking status rather than making a namespace scan authoritative or failed. Refreshing metadata may re-render clean and dirty Views, but changes to permissions, size, or timestamps never create FRED namespace conflicts.
 
@@ -785,7 +793,7 @@ There is no general temporary filter command. Hidden-file visibility is handled 
 
 ### 7.8 Expansion, Reveal, And Navigation
 
-A View has a configurable baseline depth plus ordinary directory expansions. Lua stores expansion depth by RootSession-scoped directory NodeId, not by buffer path or current-root-relative identifier. The version-one projection remains a flat list of complete paths relative to the instance's `current_root`, while the shared NodeId expansion state is independent of the codec.
+A View has a configurable baseline depth plus ordinary directory expansions. Lua stores expansion depth by RootSession-scoped directory NodeId, not by buffer path or current-root-relative identifier. The version-one projection remains a flat list of complete paths relative to the instance's `current_root`, while the shared NodeId expansion state is independent of flat line encoding.
 
 Example at `/project` with baseline depth `0`:
 
@@ -862,13 +870,13 @@ Before preparation, the `BufWriteCmd` handler validates all of the following:
 
 An alternate target filename is rejected rather than treated as an export. A Hidden Instance cannot enter the write/Apply pipeline or refresh. The user must reopen it, making it Open and displayed, before `:write`, `instance:refresh()`, or `:FredRefresh` is accepted; only the write and `:FredRefresh` additionally require that buffer to be current.
 
-The Lua handler captures semantic rows through the active `ProjectionCodec` and `BufferProjectionEngine`, then calls `apply_prepare(view_handle, CaptureRequest)`. Rust validates and records normalized ViewIntent, performs the initial immutable probes, and calls the pure Planner. A rejected result returns diagnostics. A valid result returns a sealed one-shot `PreparedApply`; a non-empty plan also returns its complete sanitized logical preview, while an empty plan has no preview.
+The Lua `BufferRuntime` captures semantic rows through the internal flat decoder, then calls `apply_prepare(view_handle, CaptureRequest)`. Rust validates and records normalized ViewIntent, performs the initial immutable probes, and calls the pure Planner. A rejected result returns diagnostics. A valid result returns a sealed one-shot `PreparedApply`; a non-empty plan also returns its complete sanitized logical preview, while an empty plan has no preview.
 
-Lua displays and confirms only the preview. Preview cancellation calls `apply_finish(prepared, Cancel)` or drops the capability, acquires no global lock, creates no `ApplyBufferGuard`, records no clean projection, and preserves the dirty text, ViewIntent, and undo history. For confirmation, or immediately for an empty plan, Lua establishes one `ApplyBufferGuard` before reading the execute witness. The guard rejects reentrant writes and prevents new ordinary edits until terminal handling finishes. Lua then calls `apply_finish(prepared, Execute { observed_changedtick, write_epoch })`. The sealed capability is consumed exactly once; changing the preview cannot change the stored `ValidPlan`.
+Lua displays and confirms only the preview. Preview cancellation drops the capability, acquires no global lock, creates no `ApplyBufferGuard`, records no clean projection, and preserves the dirty text, ViewIntent, and undo history. For confirmation, or immediately for an empty plan, Lua establishes one `ApplyBufferGuard`, records its local `write_epoch`, and reads `observed_changedtick`. The guard rejects reentrant writes and prevents new ordinary edits until terminal handling finishes. Lua then calls `apply_finish(prepared, Execute { observed_changedtick })`. Rust consumes the sealed capability exactly once and never receives authority over `write_epoch`; changing the preview cannot change the stored `ValidPlan`.
 
-The `BufWriteCmd` handler waits for a terminal Apply outcome while pumping bounded Neovim events. The running execute task may expose internal progress and a cancellation control. Before a cancellation already requested on that task may abandon intent, Rust validates the sealed capability's current initiating View ownership and View/root/projection/edit-base/planned-root/intent/changedtick authority against the execute witness. Stale authority returns a pre-execution stale error and preserves newer intent. Once a current Execute is accepted, cooperative cancellation may produce the clean execution-cancellation outcome even before gate acquisition or the first syscall.
+The `BufWriteCmd` handler waits for a terminal Apply outcome while pumping bounded Neovim events. The running execute task may expose internal progress and a cancellation control. Before a cancellation already requested on that task may abandon intent, Rust validates the sealed `ApplyAuthorityStamp` against current View/root/projection state and `observed_changedtick`. Stale authority returns a pre-execution stale error and preserves newer intent. Once a current Execute is accepted, cooperative cancellation may produce the clean execution-cancellation outcome even before gate acquisition or the first syscall.
 
-For Neovim 0.12.4 `acwrite` behavior, every outcome that produces a clean frame is synchronized inside the active `BufWriteCmd`: Lua revalidates the same live Instance and View, generations, clean frame, `ApplyBufferGuard.write_epoch`, and expected unchanged changedtick; renders with edit capture suppressed; commits the projection; reconciles the cursor; establishes a new ordinary undo baseline; and sets `'modified' = false` before returning. Success and an empty plan return write success only after that synchronous commit, allowing ordinary `:wq` to exit. Execution failure or accepted execution cancellation returns write failure only after the same synchronous clean commit, so `:wq` remains open with a clean buffer. Best-effort refresh and ancillary progress/diagnostic UI may run later, but the clean projection and modified-state transition are never deferred.
+For Neovim 0.12.4 `acwrite` behavior, every outcome that produces a clean result is synchronized inside the active `BufWriteCmd`: Rust returns one sealed `TerminalProjection`, and Lua revalidates the same live Instance and View, its local `ApplyBufferGuard.write_epoch`, the terminal frame token, and expected unchanged changedtick; consumes the frame and NodeId transitions through one non-reentrant one-shot critical section, renders with edit capture suppressed, commits the projection, reconciles the cursor, establishes a new ordinary undo baseline, and sets `'modified' = false` before returning. Success and an empty plan return write success only after that synchronous commit, allowing ordinary `:wq` to exit. Execution failure or accepted execution cancellation returns write failure only after the same synchronous clean commit, so `:wq` remains open with a clean buffer. Best-effort refresh and ancillary progress/diagnostic UI may run later, but the clean projection and modified-state transition are never deferred.
 
 Preview cancellation, validation failure, stale authority, Busy lock contention, final-preflight failure, or another pre-execution abort performs no clean render, preserves buffer text, ViewIntent, `'modified'`, and undo history, and releases `ApplyBufferGuard` if one exists before returning write failure. A clean-outcome synchronization that finds a destroyed Instance, missing View, generation mismatch, frame mismatch, write-epoch mismatch, or unexpected changedtick does not resurrect or overwrite anything; it releases `ApplyBufferGuard` and returns a terminal write failure/no-op for the buffer while preserving the filesystem result. A synchronous render or ProjectionCommit error is fail-fast, releases the guard, and returns write failure. Every successful synchronization also releases the guard before `BufWriteCmd` returns.
 
@@ -1124,6 +1132,7 @@ MetadataRevision
 ScanGeneration
 CoverageGeneration
 IntentGeneration
+ViewAuthorityEpoch
 FrameSequence
 ProjectionRevision
 ChangedTick
@@ -1173,7 +1182,7 @@ RootSnapshot {
 
 Directory membership is authoritative only when that directory's status is `Complete`. A Complete result replaces the prior direct-child set and may prove that an old child disappeared. A Partial or Failed result merges newly observed children into the prior snapshot but carries forward every previously known unobserved child as `RetainedUnverified`; it never converts non-observation into deletion. Retained nodes remain in path and parent/child indexes and may be displayed with degraded status. A later Complete result, successful execution model update, or authoritative direct probe may confirm or remove them. Initial partial scans cannot invent unknown entries, but entries never committed to a projection cannot be interpreted as deletions.
 
-A scan generation builds one candidate snapshot through bounded internal worker events without mutating `current_snapshot`. Scan progress may be reported while work runs, but candidate nodes do not enter Lua's editable projection. A generation publishes exactly one new immutable `current_snapshot` only after every requested scope reaches a terminal complete, partial, or failed result; only then does Rust build the next ViewSemanticFrame. Late or cancelled generations cannot publish, and candidate data never advances a dirty View's edit base.
+A scan worker builds one self-consistent candidate snapshot off the main thread without mutating `current_snapshot`. It may emit throttled progress while work runs, but candidate nodes do not cross into Lua or require main-thread per-node assembly. The worker hands off one immutable candidate on completion. A generation publishes exactly one new immutable `current_snapshot` only after every requested scope reaches a terminal complete, partial, or failed result; only then does Rust build the next ViewSemanticFrame. Late or cancelled generations cannot publish, and candidate data never advances a dirty View's edit base.
 
 NodeId lifetime rules are:
 
@@ -1195,10 +1204,8 @@ Published snapshots remain alive while referenced by Views or active tasks. Opti
 RootSession {
   id: RootSessionId
   session_root: CanonicalRoot
-  current_snapshot: Arc<RootSnapshot>
-  root_revision
-  metadata_snapshot
-  metadata_revision
+  current_snapshot: Arc<RootSnapshot>  -- contains the authoritative RootRevision
+  metadata_snapshot                 -- contains the authoritative MetadataRevision
   node_id_allocator
   scan_cache
   scan_generation
@@ -1206,11 +1213,12 @@ RootSession {
   watcher_state
   coverage_by_view
   metadata_reference_counts
-  task_state: Idle | Scan | Apply
+  scan_task: optional ScanTask
+  queued_scan_request
 }
 ```
 
-The RootSession does not own the process-global mutation lock. The runtime registry stores Weak references for exact canonical session roots; attached Views and active tasks hold strong references.
+The RootSession does not own a mutation state or the process-global mutation lock. One runtime-level `MutationCoordinator` owns the gate, active affected-path fence, execution cancellation, and queued post-terminal refresh. RootSession scan start and publication consult that coordinator but never transition to `Apply`. The runtime registry stores Weak references for exact canonical session roots; attached Views and active tasks hold strong references.
 
 Sharing rules are explicit:
 
@@ -1234,29 +1242,29 @@ View {
   root_session: Arc<RootSession>
   root_node_id: NodeId
   root_status: Present | Missing { last_known_session_path }
-  view_generation
-  edit_base: Arc<RootSnapshot>
-  edit_base_revision: RootRevision
+  authority_epoch: ViewAuthorityEpoch
+  edit_base: Arc<RootSnapshot>  -- its revision is edit_base.revision
   intent: ViewIntent
   committed_projection: optional CommittedProjection
   frame_sequence
 }
 ```
 
-`root_node_id` is the current namespace root for that View. The FlatProjectionCodec renders paths relative to this node. Changing `root_node_id` inside the same session rebases View-relative paths without reallocating descendant NodeIds.
+`authority_epoch` increases whenever `root_node_id`, root status, edit base, ViewIntent, or CommittedProjection changes or is invalidated. Every accepted `CaptureRequest` increments it when advancing/replacing ViewIntent, even when the normalized capture is semantically identical and changedtick is unchanged; therefore a later prepare always makes an older unused PreparedApply stale. It is the compact stale-authority witness for Apply; the underlying scan, metadata, intent, frame, projection, and changedtick counters remain distinct for their own protocols.
 
-Lua captures the editable buffer into projection-neutral rows:
+`root_node_id` is the current namespace root for that View. The internal flat projection renders paths relative to this node. Changing `root_node_id` inside the same session rebases View-relative paths without reallocating descendant NodeIds.
+
+Lua captures the editable buffer into projection-neutral rows. The opaque `view_handle` supplied to the native call identifies the View, so requests do not repeat a forgeable `view_id` field. A provenance source uses one scoped transport identity whose NodeId token already carries its RootSession namespace:
 
 ```text
 SemanticCaptureRow {
   node_id: NodeId
   desired_path: RelativePathCandidate
   desired_kind
-  copy_from: optional { root_session_id, node_id }
+  copy_from: optional ScopedNodeId
 }
 
 CaptureRequest {
-  view_id
   committed_projection_revision
   changedtick
   rows: [SemanticCaptureRow]
@@ -1274,7 +1282,6 @@ NodeOrigin = Existing
 
 ViewIntent {
   generation: IntentGeneration
-  root_node_id: NodeId
   existing_changes: Map<NodeId, ExistingDesiredChange>
   removed_existing: Set<NodeId>
   pending_nodes: Map<NodeId, PendingDesiredNode>
@@ -1283,13 +1290,12 @@ ViewIntent {
 }
 ```
 
-Rust never stores FlatProjectionCodec text as intent. It stores validated desired View-relative paths anchored to the stable `root_node_id`, kinds, identity, and provenance, and derives canonical session paths from the root node's current location whenever it builds a semantic frame, probes, or plans. Therefore a dirty View's pending creates, copies, and path edits follow a same-session MOVE of its root NodeId while preserving their relative locations. Planner may mark a unique PendingCopy destination as the logical destination of a removed source, but ViewIntent retains both the provisional destination NodeId and `copy_from` until a terminal Apply outcome. CREATE/COPY destinations retain their allocated NodeIds; successful MOVE identity retirement is committed only by Snapshot application of known successful effects.
+ViewIntent paths are implicitly anchored to the owning View's stable `root_node_id`; navigation requires a clean View, so a second stored root identity inside ViewIntent would be redundant. Rust never stores flat projection text as intent. It stores validated desired View-relative paths, kinds, identity, and provenance, and derives canonical session paths from the root node's current location whenever it builds a semantic frame, probes, or plans. Therefore a dirty View's pending creates, copies, and path edits follow a same-session MOVE of its root NodeId while preserving their relative locations. Planner may mark a unique PendingCopy destination as the logical destination of a removed source, but ViewIntent retains both the provisional destination NodeId and `copy_from` until a terminal Apply outcome. CREATE/COPY destinations retain their allocated NodeIds; successful MOVE identity retirement is committed only by Snapshot application of known successful effects.
 
-After Lua renders a frame, it submits:
+After Lua renders a frame, it submits through the View handle:
 
 ```text
 ProjectionCommitRequest {
-  view_id
   frame_token
   ordered_node_ids: [NodeId]
   changedtick
@@ -1298,13 +1304,26 @@ ProjectionCommitRequest {
 CommittedProjection {
   revision: ProjectionRevision
   source_frame
-  ordered_node_ids
-  node_id_set
+  visible_node_ids: Set<NodeId>
   changedtick
 }
 ```
 
-The call is synchronous and fail-fast. There is no projection lease, rollback protocol, recovery state, or automatic renderer retry. `CommittedProjection` is the authoritative baseline for distinguishing a user-deleted bound node from a node that never entered the editable projection.
+The ordered request lets Rust validate uniqueness and current-frame membership, but presentation order remains Lua-owned and is not duplicated in Rust. The call is synchronous and fail-fast. There is no projection lease, rollback protocol, recovery state, or automatic renderer retry. `CommittedProjection` is the authoritative baseline for distinguishing a user-deleted bound node from a node that never entered the editable projection.
+
+Apply seals one compact authority object rather than copying a list of loosely related fields through every layer:
+
+```text
+ApplyAuthorityStamp {
+  view_id: ViewId
+  view_authority_epoch: ViewAuthorityEpoch
+  root_revision: RootRevision
+  projection_revision: ProjectionRevision
+  changedtick: ChangedTick
+}
+```
+
+`apply_prepare` records this stamp after accepting capture and planning. `apply_finish` validates it before any requested cancellation may clear intent and, for a non-empty mutation, validates it again after gate acquisition, fence registration, and overlapping-scan invalidation. Lua's `write_epoch` is deliberately absent because it is a Lua-local buffer guard witness.
 
 ### 10.5 ViewSemanticFrame And Bounded Transport
 
@@ -1339,7 +1358,7 @@ UnplacedViewNode {
 ViewFrameToken {
   root_session_id
   view_id
-  view_generation
+  view_authority_epoch
   root_revision
   metadata_revision
   intent_generation
@@ -1373,7 +1392,7 @@ FrameCancelled { token }
 
 Lua rejects mixed or stale tokens. Rust child lists represent membership only; each Lua View applies its own sort.
 
-### 10.6 Lua Materialization, Projector, Codec, And Buffer Engine
+### 10.6 Lua View Projection And BufferRuntime
 
 Each Instance/View owns Lua state:
 
@@ -1401,7 +1420,7 @@ PresentationState {
 }
 ```
 
-Expansion is keyed by NodeId. Same-session navigation therefore preserves descendant expansion automatically. A child Instance snapshots the parent's expansion entries inside the selected directory subtree and then evolves independently. A FRED directory MOVE retains expansion because the source NodeId is stable. Planner normalization alone does not change Lua state. When terminal Apply handling returns an authoritative `NodeIdTransition` for a successfully realized PendingCopy-derived MOVE, Lua atomically remaps expansion, cursor identity, and row bindings while synchronously rendering the clean frame. Preview cancellation and pre-execution errors apply no transition; COPY and cross-filesystem identity-split destinations retain their own NodeIds and do not inherit source expansion by default.
+Expansion is keyed by NodeId. Same-session navigation therefore preserves descendant expansion automatically. A child Instance snapshots the parent's expansion entries inside the selected directory subtree and then evolves independently. A FRED directory MOVE retains expansion because the source NodeId is stable. Planner normalization alone does not change Lua state. Terminal Apply handling returns one sealed `TerminalProjection` whose frame and authoritative NodeId transitions are consumed together by Lua `BufferRuntime` and can never be split, mixed, or replayed independently; expansion, cursor identity, and row bindings therefore cannot observe different terminal identities. Preview cancellation and pre-execution errors apply no transition; COPY and cross-filesystem identity-split destinations retain their own NodeIds and do not inherit source expansion by default.
 
 The Lua catalog mirror contains the current frame token, root NodeId/status, nodes by NodeId, child membership, unplaced nodes, directory statuses, and completion state. A Missing root status is a View-level diagnostic and does not cause Lua to replace the existing editable buffer with an empty projection. The common projector:
 
@@ -1411,21 +1430,18 @@ The Lua catalog mirror contains the current frame token, root NodeId/status, nod
 4. performs depth-first traversal so every materialized directory subtree remains contiguous;
 5. produces one ordered `ProjectedRow` sequence containing NodeId, parent NodeId, depth, View-relative path, name, kind, state, and metadata.
 
-Flat and future tree rendering consume the same ProjectedRow order. Version one implements only an internal sealed codec:
+Flat and future tree rendering consume the same ProjectedRow order. Version one has only two internal pure flat functions rather than a general projection interface:
 
 ```text
-ProjectionCodec {
-  encode(ProjectedRows) -> lines, binding specs, decorations
-  decode(buffer lines, NodeId bindings) -> SemanticCaptureRows
-}
-
-FlatProjectionCodec.encode(row) = row.view_relative_path
-FlatProjectionCodec.decode(line) = desired View-relative path candidate
+flat_encode(ProjectedRows) -> lines, binding specs, decorations
+flat_decode(buffer lines, NodeId bindings) -> SemanticCaptureRows
 ```
 
-Version one exposes no projection-mode option, tree codec, toggle, custom renderer, or public codec registration seam.
+`flat_encode` writes `row.view_relative_path`; `flat_decode` returns a desired View-relative path candidate. A general projection interface is introduced only when a second built-in projection exists. Version one exposes no projection-mode option, tree projection, toggle, custom renderer, or public registration seam.
 
-The Lua `BufferProjectionEngine` owns the buffer number, extmark namespace, current frame token, projection revision, NodeId bindings, internal-sync depth, changedtick, line rendering and capture, full-line range extmarks, virtual text, cursor reconciliation, `'modified'`, and undo-baseline resets. During semantic capture it consumes optional normalized `copy_from` facts from `ProvenanceStore`, but it does not own register snapshots, `TextYankPost`, `p`/`P` wrappers, or inserted-range provenance state. Rust does not read or write those objects.
+`ProjectedRow` values are a transient projection result. Lua retains the catalog mirror, ordered projected NodeIds, and buffer bindings, but does not retain a second full per-row object graph after rendering; encoding and decorations may resolve row fields from the catalog by NodeId.
+
+The Lua `BufferRuntime` is the sole owner of the buffer number, extmark namespace, current frame token, projection revision, NodeId bindings, internal-sync depth, changedtick, Lua-local write epoch, line rendering and capture, full-line range extmarks, virtual text, cursor reconciliation, `'modified'`, undo-baseline resets, write-command routing, `ApplyBufferGuard`, and one-shot joint `TerminalProjection` consumption. During semantic capture it consumes optional normalized `copy_from` facts from `ProvenanceStore`, but it does not own register snapshots, `TextYankPost`, `p`/`P` wrappers, or inserted-range provenance state. Rust does not read or write those objects.
 
 When a clean View becomes dirty, Lua freezes each currently materialized sibling order rather than one catalog-global order. Metadata may update virtual columns, but no comparator result moves real rows until the View becomes clean. Hidden-file membership changes take filtered subsets or supersets of those frozen sibling orders. Newly discovered nodes use deterministic sibling-local fallback order until clean recomputation.
 
@@ -1453,7 +1469,7 @@ Creating a child Instance on a directory inside the parent session creates a new
 
 ## 11. Identity And Provenance
 
-Lua's shared `BufferProjectionEngine`, not an individual codec and not Rust, owns NodeId-to-row bindings. Every rendered semantic row receives a full-line range extmark mapped to its opaque RootSession-scoped NodeId. The range spans `[row, 0]` through `[row + 1, 0]` with `right_gravity = false`, `end_right_gravity = true`, `invalidate = true`, and `undo_restore = true`. Internal projection rendering runs under a Lua sync guard that suppresses edit capture and recreates bindings without generating filesystem intent.
+Lua's shared `BufferRuntime`, not a flat projection helper and not Rust, owns NodeId-to-row bindings. Every rendered semantic row receives a full-line range extmark mapped to its opaque RootSession-scoped NodeId. The range spans `[row, 0]` through `[row + 1, 0]` with `right_gravity = false`, `end_right_gravity = true`, `invalidate = true`, and `undo_restore = true`. Internal projection rendering runs under a Lua sync guard that suppresses edit capture and recreates bindings without generating filesystem intent.
 
 Identity rules are:
 
@@ -1476,7 +1492,7 @@ Extmarks do not travel through yank or put. Lua's `ProvenanceStore` therefore ow
 - parent and child Views sharing one RootSession may exchange provenance; an independent overlapping RootSession may not;
 - insertions without valid provenance are PendingCreate declarations even when their text matches an existing row.
 
-`BufferProjectionEngine` never stores register provenance. During semantic capture it asks `ProvenanceStore` to qualify observed inserted rows and receives only the normalized optional `copy_from` fact for each row.
+`BufferRuntime` never stores register provenance. During semantic capture it asks `ProvenanceStore` to qualify observed inserted rows and receives only the normalized optional `copy_from` fact for each row.
 
 Lua submits only the normalized `copy_from` reference. Rust validates same-session source identity and stores it in ViewIntent without classifying the operation. Planner later groups final destinations by source identity and normalizes the final desired state:
 
@@ -1513,23 +1529,22 @@ CoverageRequest {
 }
 ```
 
-The worker emits bounded events such as:
+The worker builds its candidate snapshot off the main thread and emits only bounded progress plus one terminal handoff:
 
 ```text
-ScanNodeBatch
-MetadataBatch
 ScanProgress
-DirectoryComplete
-DirectoryFailed
-ScanComplete
+ScanFinished { scan_generation, candidate_snapshot }
 ScanCancelled
+MetadataProgress
+MetadataFinished { metadata_generation, source_root_revision, metadata_patch }
+MetadataCancelled
 ```
 
-After a candidate snapshot or semantic intent changes, Rust emits bounded `ViewSemanticFrame` events as defined in Section 10.5. Requirements are:
+`candidate_snapshot` and `metadata_patch` are Rust-owned immutable/task-local values handed off by pointer or ownership; the main thread does not assemble namespace nodes from per-node scan events. After a candidate snapshot is accepted or semantic intent changes, Rust emits bounded `ViewSemanticFrame` events as defined in Section 10.5. Requirements are:
 
-- allocate or reuse RootSession-scoped NodeIds and construct `nodes_by_id`, `children_by_parent`, path index, directory status, and Confirmed/RetainedUnverified observation state as one self-consistent candidate snapshot;
-- emit at most `render_batch_size` node facts per batch and expose every node in each requested scope regardless of Lua hidden-file classification;
-- attach `scan_generation` to namespace events and `metadata_generation` plus `source_root_revision` to metadata events;
+- allocate or reuse RootSession-scoped NodeIds and construct `nodes_by_id`, `children_by_parent`, path index, directory status, and Confirmed/RetainedUnverified observation state as one self-consistent worker-owned candidate snapshot;
+- expose every node in each requested scope regardless of Lua hidden-file classification, while batching only the later ViewSemanticFrame delivery to Lua at no more than `render_batch_size` node facts per batch;
+- attach `scan_generation` to scan progress/completion and `metadata_generation` plus `source_root_revision` to metadata progress/completion;
 - discard obsolete scan, metadata, coverage, and View-frame generations;
 - consult the process-wide active mutation affected-path fence both before starting a scan generation and immediately before publication; overlapping requests are queued or cancelled, and neither existing nor newly created RootSessions may publish across an active mutation;
 - record each requested directory NodeId as Complete, Partial, or Failed; Complete membership may remove absent prior children, while Partial/Failed membership must carry prior unobserved children forward as RetainedUnverified;
@@ -1541,7 +1556,7 @@ After a candidate snapshot or semantic intent changes, Rust emits bounded `ViewS
 - keep child membership free of View-specific sort order;
 - accept a post-render `ProjectionCommitRequest` only when its frame token is current and every submitted NodeId belongs to that frame exactly once;
 - accept a semantic `CaptureRequest` only when its projection revision and changedtick match the initiating Lua buffer state and all NodeIds are current, unique, and valid for that View;
-- accept a MetadataBatch only when its metadata generation and source RootRevision are current, every field remains required, and NodeId plus observed encoded path still match the current snapshot;
+- accept a completed metadata patch only when its metadata generation and source RootRevision are current, every field remains required, and NodeId plus observed encoded path still match the current snapshot;
 - attach metadata observations to NodeId plus observed path so a late value cannot bind to a moved or replaced node;
 - fetch stat metadata only when a Lua column or SortSpec requires it;
 - allow metadata-only enrichment without publishing a namespace snapshot or advancing RootRevision;
@@ -1594,7 +1609,7 @@ The RootSession registry retains Weak references so registry membership alone ne
 
 Once active tasks release the final strong RootSession reference, the RootSession, current and obsolete snapshots, metadata/cache state, coverage bookkeeping, and watchers drop naturally. There is no object-level cleanup or pruning, periodic sweeper, LRU, estimated-memory policy, idle-age policy, cached-entry-count policy, or other Rust retention policy.
 
-`max_entries` and `max_directories` bound each requested scan generation, and bounded channels/batches bound provisional task-owned work. They do not bound cumulative cache retained by a still-live RootSession: a long-lived session may retain namespace and metadata state for scopes visited by earlier generations even after current View coverage moves elsewhere. Cancelled or superseded provisional task-owned batches are still released promptly through ordinary ownership, while the only guaranteed release of all retained cache is final whole-RootSession release.
+`max_entries` and `max_directories` bound each requested scan generation, bounded progress channels and frame batches bound cross-thread/main-thread delivery, and task ownership bounds provisional candidate work. They do not bound cumulative cache retained by a still-live RootSession: a long-lived session may retain namespace and metadata state for scopes visited by earlier generations even after current View coverage moves elsewhere. Cancelled or superseded provisional task-owned batches are still released promptly through ordinary ownership, while the only guaranteed release of all retained cache is final whole-RootSession release.
 
 ## 13. Ignore, Hidden Files, Sort, And Depth
 
@@ -1645,34 +1660,29 @@ Default ordering is ascending, case-insensitive stable lexical ordering within e
 
 ## 14. Planner
 
-The Planner is a pure Rust module and one of the two domain dependencies of the deep `apply` module. It receives immutable inputs and returns either a `ValidPlan` or non-confirmable diagnostics. It never performs filesystem I/O, owns no global lock, retains no `PreparedApply`, and mutates neither the filesystem nor a RootSession.
+The Planner is a pure Rust module and one of the two domain dependencies of the process-level `mutation` module. It receives immutable inputs and returns either a `ValidPlan` or non-confirmable diagnostics. It never performs filesystem I/O, owns no global lock, retains no `PreparedApply`, and mutates neither the filesystem nor a RootSession.
 
 Inputs:
 
 ```text
-View edit-base snapshot and edit_base_revision
-current published snapshot and planned_root_revision
+View edit-base snapshot
+current published snapshot
 current View root_node_id
 captured ViewIntent with desired View-relative paths anchored to that root
-current changedtick and intent generation
+immutable ApplyAuthorityStamp
 immutable initial direct namespace-probe results
 path and platform rules
-execution policy
 ```
 
 Outputs:
 
 ```text
 ValidPlan {
-  edit_base_revision
-  planned_root_revision
-  projection_revision
-  changedtick
-  intent_generation
+  authority: ApplyAuthorityStamp
   planned_identity_dispositions
-  ordered execution DAG
-  logical preview groups
-  affected paths
+  execution_program: [ExecutionNode]
+  logical_preview_groups
+  affected_paths
   final_probe_expectations
 }
 
@@ -1684,7 +1694,7 @@ Diagnostics {
 }
 ```
 
-The Planner owns final-state validation and normalization, COPY/MOVE/DELETE classification, planned identity dispositions, logical preview construction, operation dependency ordering, affected-path calculation, and the expectations that final preflight must repeat. It does not own the preview UI, execution report, or application of terminal NodeId transitions. Logical operations shown to users include:
+The Planner owns final-state validation and normalization, COPY/MOVE/DELETE classification, planned identity dispositions, logical preview construction, operation dependency ordering, affected-path calculation, and the expectations that final preflight must repeat. It may construct a dependency graph transiently to resolve parent ordering, evacuation, swaps, cycles, and case-only renames, but `ValidPlan` stores only the final linear `execution_program` because version one executes serially. It does not own the preview UI, execution report, or application of terminal NodeId transitions. Logical operations shown to users include:
 
 ```text
 CREATE
@@ -1732,7 +1742,7 @@ Planner validation rejects:
 
 The Planner does not reject ordinary file-content, permission, size, or timestamp changes. A destination occupied by another planned identity is allowed only when that identity is moved away or explicitly removed earlier in the same plan. Final execution still uses exclusive/no-replace operations.
 
-`apply_prepare` is the sole orchestration caller for buffer plans. It validates and records the CaptureRequest as ViewIntent, performs the initial probes required by that intent, calls the Planner, and on success seals the immutable `ValidPlan`—including Planner-owned affected paths and final-probe expectations—plus View/root/projection/edit-base/planned-root/intent/changedtick authority and weak initiating handles into one opaque `PreparedApply` userdata. Lua receives the capability plus only the sanitized logical preview. The capability is not stored in a process-wide prepared-plan registry, cannot be cloned or inspected as plan data, and contains only an internal `Fresh -> Consumed` slot. Every accepted semantic capture advances intent generation, so a later prepare makes an earlier unused capability stale even without a registry. Explicit preview cancellation and handle drop release its owned plan memory.
+`apply_prepare` is the sole orchestration caller for buffer plans. It validates and records the CaptureRequest as ViewIntent, performs the initial probes required by that intent, calls the Planner, and on success seals the immutable `ValidPlan`—including its linear execution program, Planner-owned affected paths, final-probe expectations, and one `ApplyAuthorityStamp`—plus weak initiating handles into one opaque `PreparedApply` userdata. Lua receives the capability plus only the sanitized logical preview. The capability is not stored in a process-wide prepared-plan registry, cannot be cloned or inspected as plan data, and contains only an internal `Fresh -> Consumed` slot. Every accepted semantic capture advances IntentGeneration and ViewAuthorityEpoch, so a later prepare makes an earlier unused capability stale even without a registry. Preview cancellation drops the handle and releases its owned plan memory.
 
 ### 14.1 Final-State Provenance Normalization
 
@@ -1767,8 +1777,8 @@ RootSnapshot
   -> serial Executor
   -> known-successful-effect report
   -> terminal Snapshot identity resolution
-  -> clean ViewSemanticFrame plus authoritative NodeIdTransition values
-  -> synchronous Lua projection commit
+  -> sealed TerminalProjection { clean frame, authoritative NodeId transitions, outcome }
+  -> one-shot synchronous Lua terminal commit
 ```
 
 The stages are:
@@ -1778,18 +1788,18 @@ The stages are:
 3. CaptureRequest contains only NodeId, desired path candidate, kind, optional normalized `copy_from`, projection revision, and changedtick. It contains no CREATE, COPY, MOVE, or DELETE instruction. Rust derives removal only for an Existing NodeId that belonged to the initiating CommittedProjection and is absent from the accepted capture.
 4. Rust stores validated Existing, PendingCreate, and PendingCopy desired state as ViewIntent. `apply_prepare` performs immutable initial probes and gives the edit base, current snapshot, ViewIntent, authority values, and probe results to Planner.
 5. Planner compares source presence with all provenance-linked destinations. Source retained produces COPY/COPY_TREE; one destination with source removed produces MOVE; multiple destinations with source removed produce copies followed by source deletion; a removed source without a provenance destination produces DELETE/DELETE_TREE. Directly editing an Existing NodeId to a new path also produces MOVE without a provisional destination.
-6. ValidPlan contains the immutable logical operations, execution DAG, planned identity dispositions, preview groups, affected paths, final-probe expectations, and authority. Planned identity dispositions are declarative plan data only. `apply_prepare` seals them into PreparedApply and does not rebind any NodeId.
-7. Preview Cancel consumes or drops PreparedApply, performs no filesystem action, preserves dirty ViewIntent, and applies no identity transition. Validation, stale, Busy, and final-preflight errors likewise apply no identity transition and preserve dirty state because no filesystem execution has begun. Accepted execution cancellation is the separate clean-sync outcome described below.
+6. ValidPlan contains the immutable logical operations, linear execution program, planned identity dispositions, preview groups, affected paths, final-probe expectations, and `ApplyAuthorityStamp`. Planner may use a transient dependency graph while constructing the program, but Executor receives only the final serial order. Planned identity dispositions are declarative plan data only. `apply_prepare` seals them into PreparedApply and does not rebind any NodeId.
+7. Preview Cancel drops PreparedApply, performs no filesystem action, preserves dirty ViewIntent, and applies no identity transition. Validation, stale, Busy, and final-preflight errors likewise apply no identity transition and preserve dirty state because no filesystem execution has begun. Accepted execution cancellation is the separate clean-sync outcome described below.
 8. After confirmed Execute passes authority and final preflight, Executor runs only the already planned nodes. Executor neither classifies operations nor assigns semantic identities; it reports COMPLETED, FAILED or CANCELLED, UNSTARTED, and every known successful internal effect.
 9. Under Apply orchestration, Snapshot combines ValidPlan's planned identity dispositions with the execution report's known successful effects. Successful CREATE/COPY retains the pending destination NodeId. A fully successful logical MOVE places the source NodeId at the destination and retires any provisional PendingCopy destination. Cross-filesystem copy success followed by source-delete failure or accepted cancellation keeps the source NodeId and a distinct destination NodeId, using the PendingCopy destination's provisional NodeId when one exists and allocating one otherwise. A move with no known successful effect leaves the source identity in place and abandons the provisional destination. Unrepresented partial COPY_TREE discoveries receive new NodeIds.
-10. Snapshot publishes one self-consistent immutable RootSnapshot. Success and empty plans clear ViewIntent; execution failure or accepted execution cancellation publishes known effects, abandons failed/cancelled and unstarted initiating intent, and also returns a clean initiating frame. Pre-execution aborts publish no clean replacement and preserve dirty intent.
-11. For every successfully realized PendingCopy-derived logical MOVE, Snapshot returns exactly one authoritative `NodeIdTransition { from: provisional_destination, to: source }` in the same terminal outcome as the clean frame. Lua never derives this mapping. During synchronous terminal handling, Lua `buffer` coordinates `presentation` expansion remapping and `BufferProjectionEngine` binding/cursor reconciliation and consumes the transition before committing that clean frame, clearing `'modified'`, and establishing the undo baseline before `BufWriteCmd` returns.
+10. Snapshot publishes one self-consistent immutable RootSnapshot for success and for execution outcomes with known filesystem effects. Execution failure or accepted post-gate cancellation applies known effects, marks potentially unreported affected directory scopes Partial, carries prior unverified members as RetainedUnverified, and abandons failed/cancelled and unstarted initiating intent. An accepted cancellation before gate acquisition and a valid empty plan clear only ViewIntent under View/RootSession state synchronization and publish no RootSnapshot. Other pre-execution aborts preserve dirty intent.
+11. For every successfully realized PendingCopy-derived logical MOVE, Snapshot produces exactly one authoritative `NodeIdTransition { from: provisional_destination, to: source }`. Apply seals the transition list together with the clean frame, terminal outcome, and expected changedtick in one `TerminalProjection`. Lua never derives or separately consumes this mapping. `BufferRuntime` validates and applies expansion, binding, cursor, rendering, ProjectionCommit, modified-state, and undo-baseline changes through one non-reentrant, one-shot terminal critical section before `BufWriteCmd` returns.
 
 The ownership rule is therefore: capture describes facts, Planner decides semantic operations and planned identity dispositions, Executor reports effects, Snapshot decides terminal identity, and Lua only projects the authoritative result.
 
 ## 15. Operation Ordering
 
-The operation DAG enforces:
+Planner dependency resolution produces one linear execution program that enforces:
 
 1. an existing planned-parent occupant is removed or moved away before the replacement parent directory is created;
 2. every planned parent-directory creation precedes CREATE, COPY, COPY_TREE, MOVE, or REPLACE installing a descendant destination;
@@ -1819,43 +1829,57 @@ DELETE_TREE
 REPLACE
 ```
 
-Each row shows the source, destination, and kind. Tree operations are displayed as one logical row. Cached informational counts may be displayed, but FRED does not enumerate a tree merely to populate preview metadata. The preview contains no execution DAG, temporary rename names, authority stamps, probe facts, or mutable reference to the plan; modifying preview data cannot change what Executor later receives.
+Each row shows the source, destination, and kind. Tree operations are displayed as one logical row. Cached informational counts may be displayed, but FRED does not enumerate a tree merely to populate preview metadata. The preview contains no execution program, temporary rename names, authority stamps, probe facts, or mutable reference to the plan; modifying preview data cannot change what Executor later receives.
 
-Confirmation is all-or-nothing. The user cannot deselect individual operations because doing so could invalidate dependencies or produce a namespace different from the edited buffer. Preview `Cancel` consumes or drops the prepared capability, never creates `ApplyBufferGuard`, never acquires the global gate, preserves dirty intent, and requires a new write to prepare another plan. A valid empty plan opens no preview, but Lua immediately establishes `ApplyBufferGuard` and consumes the same kind of capability through `apply_finish(... Execute ...)`, so empty and non-empty plans share the final changedtick and authority checks.
+Confirmation is all-or-nothing. The user cannot deselect individual operations because doing so could invalidate dependencies or produce a namespace different from the edited buffer. Preview `Cancel` drops the prepared capability, never creates `ApplyBufferGuard`, never acquires the global gate, preserves dirty intent, and requires a new write to prepare another plan. A valid empty plan opens no preview, but Lua immediately establishes `ApplyBufferGuard` and consumes the same kind of capability through `apply_finish(... Execute ...)`, so empty and non-empty plans share the final changedtick and authority checks.
 
-`PreparedApply` is not public API, is not a general ApplyAttempt state machine, and is not retained in a process-wide registry. Its only lifecycle is an internal one-shot `Fresh -> Consumed` transition. Duplicate finish, replay, foreign userdata, or finish after cancellation/drop is rejected. View destruction before Execute makes the weak initiating handle fail authority validation; destruction after mutation begins does not stop required fail-stop finalization. Synchronous clean handling that observes destruction or a generation mismatch performs no buffer resurrection or overwrite and always releases `ApplyBufferGuard`.
+`PreparedApply` is not public API, is not a general ApplyAttempt state machine, and is not retained in a process-wide registry. Its only executable lifecycle is an internal one-shot `Fresh -> Consumed` transition; dropping a Fresh capability is the non-executing terminal path. Duplicate finish, replay, foreign userdata, or finish after drop is rejected. View destruction before Execute makes the weak initiating handle fail authority validation; destruction after mutation begins does not stop required fail-stop finalization. Synchronous clean handling that observes destruction or a generation mismatch performs no buffer resurrection or overwrite and always releases `ApplyBufferGuard`.
 
 ## 17. Apply Pipeline, Executor, And Failure Semantics
 
-The deep Rust `apply` module owns the complete prepare-to-terminal data flow. Its two domain dependencies are the pure Planner and serial Executor. Lua remains the only owner of preview UI and FRED buffer synchronization; Lua never receives the execution DAG.
+The process-level Rust `mutation` module owns the complete prepare-to-terminal data flow. Its two domain dependencies are the pure Planner and serial Executor. Lua remains the only owner of preview UI and FRED buffer synchronization; Lua never receives the execution program.
 
-Before `apply_finish(... Execute ...)`, Lua creates `ApplyBufferGuard`, prevents reentrant writes and new ordinary edits, reads `observed_changedtick` and `write_epoch`, and retains the guard until synchronous terminal handling releases it. Execute atomically consumes the sealed capability before any lock attempt, so even Busy, stale, final-preflight, failure, or cancellation outcomes cannot reuse it.
+A clean terminal result is one indivisible protocol value:
+
+```text
+TerminalProjection {
+  frame: ViewSemanticFrame
+  node_id_transitions: [NodeIdTransition]
+  outcome: Empty | Success | ExecutionFailed | ExecutionCancelled
+  expected_changedtick: ChangedTick
+  sealed_identity
+}
+```
+
+“Indivisible” means the frame and transitions share one sealed identity and one-shot consumption path: they cannot be separately replayed, reordered, or combined with another terminal result. It does not promise transactional rollback of Neovim presentation calls. `BufferRuntime` processes the value inside one non-reentrant guard in the fixed order below; if rendering or ProjectionCommit fails after presentation work has begun, Section 22.6 fail-fast semantics apply, partial presentation updates may remain, and no filesystem or terminal-identity rollback is attempted.
+
+Before `apply_finish(... Execute ...)`, Lua creates `ApplyBufferGuard`, prevents reentrant writes and new ordinary edits, records a Lua-local `write_epoch`, reads `observed_changedtick`, and retains the guard until synchronous terminal handling releases it. Only `observed_changedtick` crosses into Rust. Execute atomically consumes the sealed capability before any lock attempt, so even Busy, stale, final-preflight, failure, or cancellation outcomes cannot reuse it.
 
 For a non-empty plan, after Execute is requested:
 
 1. the Apply task exposes only its generic internal progress/cancellation handle to Lua;
-2. upgrade the weak initiating View/RootSession handles and validate current View ownership, View generation, root NodeId, projection revision, edit-base revision, planned-root revision, intent generation, and the Lua observed changedtick/write-epoch witness against the sealed authority;
-3. if that validation is stale, return a pre-execution stale error, preserve the current/newer ViewIntent and dirty buffer, and release `ApplyBufferGuard`; an already-requested cancellation cannot bypass this check;
-4. once current Execute is accepted, if cancellation is already requested before gate acquisition, skip mutation and follow the clean execution-cancellation outcome in Section 17.4;
-5. otherwise acquire the process-global mutation lock, or return Busy without mutation, preserve dirty intent, and release `ApplyBufferGuard`;
-6. register the immutable `ValidPlan` affected paths in the process-wide active mutation fence before enumerating RootSessions or issuing the first syscall, then create one common finalizer that owns every later exit, including cancellation and panic-to-error conversion;
-7. cancel/fence existing initiating and overlapping RootSession scan generations, enter Apply, and require every RootSession created later to consult the active fence at scan start and publication;
-8. repeat every required source, destination, existing-parent, planned-parent-state, nearest-existing-ancestor, kind, occupancy, and symlink-traversal probe under the lock; cancellation observed here follows Section 17.4 only because authority was already validated;
-9. if every check succeeds, pass the immutable `ValidPlan` and cancellation token to Executor;
-10. combine ValidPlan's planned identity dispositions with every known successful effect, derive the authoritative terminal identity outcome through Snapshot construction, and publish the resulting immutable RootSnapshot;
-11. clear or abandon initiating ViewIntent according to the terminal outcome, build the clean initiating semantic frame and authoritative NodeIdTransition values when required, invalidate overlapping RootSessions, and queue best-effort refresh;
-12. run the common finalizer: coalesce and schedule queued refresh demand, leave Apply, release scan-generation fences, remove the process-wide active mutation fence, and release the global mutation lock before the terminal outcome becomes observable;
-13. Lua synchronously consumes the terminal frame and any authoritative NodeIdTransition values, or handles the abort, and releases `ApplyBufferGuard` before `BufWriteCmd` returns.
+2. upgrade the weak initiating View/RootSession handles and compare the sealed `ApplyAuthorityStamp` with current Rust state plus `observed_changedtick`; Lua independently retains authority over `ApplyBufferGuard.write_epoch`;
+3. if validation is stale, return a pre-execution stale error, preserve the current/newer ViewIntent and dirty buffer, and let Lua release `ApplyBufferGuard`; an already-requested cancellation cannot bypass this check;
+4. once current Execute is accepted, if cancellation is already requested before gate acquisition, revalidate `ApplyAuthorityStamp` under View/RootSession state synchronization, clear only the initiating ViewIntent, build a clean frame from that same current RootSnapshot, and return a cancellation `TerminalProjection` without publishing a RootSnapshot, registering a fence, or creating process mutation state;
+5. otherwise acquire the process-global mutation lock, or return Busy without mutation and preserve dirty intent;
+6. set the process-level MutationCoordinator to Running, register the immutable `ValidPlan` affected paths in the active mutation fence before enumerating RootSessions or issuing the first syscall, and create one common finalizer that owns every later exit, including cancellation and panic-to-error conversion;
+7. cancel/fence existing initiating and overlapping RootSession scan generations, require every RootSession created later to consult the active fence at scan start and publication, then revalidate the sealed `ApplyAuthorityStamp`; a mismatch exits through the common finalizer without mutation and preserves dirty intent;
+8. repeat every required source, destination, existing-parent, planned-parent-state, nearest-existing-ancestor, kind, occupancy, and symlink-traversal probe under the lock; cancellation observed here follows Section 17.4 because authority has passed both validations;
+9. if every check succeeds, pass the immutable `execution_program` and cancellation token to Executor;
+10. combine ValidPlan's planned identity dispositions with every known successful effect, derive the authoritative terminal identity outcome through Snapshot construction, mark scopes that may contain unreported partial effects as Partial/RetainedUnverified, and publish the resulting immutable RootSnapshot;
+11. clear or abandon initiating ViewIntent according to the terminal outcome, build one `TerminalProjection`, invalidate overlapping RootSessions, and queue best-effort refresh;
+12. run the common finalizer: coalesce and schedule queued refresh demand, release scan-generation fences, remove the active mutation fence, set MutationCoordinator to Idle, and release the global mutation lock before the terminal outcome becomes observable;
+13. Lua `BufferRuntime` validates its live Instance/View, local `write_epoch`, expected changedtick, terminal sealed identity, frame, and transition consistency, then consumes `TerminalProjection` exactly once and releases `ApplyBufferGuard` before `BufWriteCmd` returns.
 
 Authority or final-probe mismatch aborts before mutation, produces no clean projection, and preserves buffer text, ViewIntent, `'modified'`, and undo history. No overlapping scan candidate from an existing or future RootSession can publish across the active mutation fence. Snapshot application of a validated execution report's known successful effects is deterministic and total; it is not a second Apply transaction owner.
 
 ### 17.1 Serial Fail-Stop Execution And Cancellation
 
-Executor accepts only a `ValidPlan` plus an internal cancellation token. `ValidPlan`, not Executor, owns affected paths. Executor does not plan, confirm, acquire the global lock, publish snapshots, invalidate overlaps, refresh Views, or operate on Lua buffers.
+Executor accepts only the sealed linear `execution_program` plus an internal cancellation token. `ValidPlan`, not Executor, owns authority, affected paths, identity dispositions, preview data, and probe expectations. Executor does not plan, confirm, acquire the global lock, publish snapshots, invalidate overlaps, refresh Views, or operate on Lua buffers.
 
 Executor rules:
 
-1. run one node at a time in DAG order;
+1. run one node at a time in `execution_program` order;
 2. check cancellation before each node;
 3. let COPY_TREE, cross-filesystem MOVE, and other long or compound operations check cancellation between entries or internal steps and at other safe checkpoints;
 4. record each system API result and every known successful internal effect;
@@ -1888,51 +1912,52 @@ At most one node is FAILED or CANCELLED. The execution report also carries known
 
 ### 17.2 Success And Empty Plans
 
-A valid empty plan is consumed through Execute, passes the final Lua witness and current View authority checks, acquires no mutation gate because it has no filesystem work, clears initiating intent, and returns a clean semantic frame for synchronous Lua commit.
+A valid empty plan is consumed through Execute, passes `ApplyAuthorityStamp`, observed changedtick, and Lua-local guard checks, acquires no mutation gate because it has no filesystem work, clears initiating intent under View/RootSession state synchronization without publishing a RootSnapshot, and returns an Empty `TerminalProjection` for synchronous Lua commit.
 
 When every non-empty execution node reports success, including cancellation first observed only after the final node succeeded, Apply:
 
 - has Snapshot combine every known successful effect with Planner-owned identity dispositions, preserve the source NodeId for each successful logical MOVE, and retire a provisional destination only after that MOVE's success is known;
 - publishes a new immutable RootSnapshot;
 - clears initiating ViewIntent;
-- returns a clean initiating semantic frame;
+- returns one Success `TerminalProjection`;
 - invalidates every RootSession overlapping a Planner-owned affected path and queues best-effort refresh;
 - reports write success;
 - exits through the common finalization path.
 
-Before `BufWriteCmd` returns write success, Lua synchronously validates and consumes the clean frame plus any authoritative NodeIdTransition values, renders with edit capture suppressed, remaps NodeId-keyed expansion when instructed, commits the projection, reconciles bindings and cursor, clears `'modified'`, establishes the new ordinary undo baseline, and releases `ApplyBufferGuard`. This ordering is required for ordinary Neovim 0.12.4 `:wq` to exit. Refresh and ancillary UI may be deferred; the clean commit may not be.
+Before `BufWriteCmd` returns write success, Lua `BufferRuntime` synchronously validates and consumes the sealed `TerminalProjection`, jointly remaps NodeId-keyed expansion, bindings, and cursor when instructed, renders with edit capture suppressed, commits the projection, clears `'modified'`, establishes the new ordinary undo baseline, and releases `ApplyBufferGuard`. This ordering is required for ordinary Neovim 0.12.4 `:wq` to exit. Refresh and ancillary UI may be deferred; the clean commit may not be.
 
 ### 17.3 Execution Failure
 
 On the first execution error, Apply:
 
 1. stops the batch and records completed, failed, and unstarted nodes plus known successful internal effects;
-2. has Snapshot apply only known successful effects and derive terminal identity, including a distinct destination NodeId when cross-filesystem copy succeeds but source deletion fails—retaining the PendingCopy provisional destination when available and allocating one otherwise—then publishes the resulting immutable RootSnapshot;
+2. has Snapshot apply only known successful effects and derive terminal identity, including a distinct destination NodeId when cross-filesystem copy succeeds but source deletion fails—retaining the PendingCopy provisional destination when available and allocating one otherwise—marks any affected scope that may contain unreported syscall effects Partial/RetainedUnverified, then publishes the resulting immutable RootSnapshot;
 3. abandons failed and unstarted initiating intent;
-4. returns a clean initiating semantic frame from the updated model;
+4. returns one ExecutionFailed `TerminalProjection` from the updated model;
 5. invalidates overlapping RootSessions and queues best-effort refresh;
 6. reports the system error and execution report;
 7. exits through the common finalization path.
 
-The failed node is not assumed wholly successful; refresh may reveal additional partial side effects left by that syscall. Before returning write failure, Lua synchronously commits the clean frame, clears `'modified'`, establishes a new undo baseline, and releases `ApplyBufferGuard`; therefore `:wq` remains open with a clean buffer. Other dirty Views retain their own intent and rebase against the next published snapshot. FRED does not offer automatic retry.
+The failed node is not assumed wholly successful; affected scopes remain visibly degraded until refresh or direct probes confirm them, and refresh may reveal additional partial side effects left by that syscall. Before returning write failure, Lua synchronously commits the sealed `TerminalProjection`, clears `'modified'`, establishes a new undo baseline, and releases `ApplyBufferGuard`; therefore `:wq` remains open with a clean buffer. Other dirty Views retain their own intent and rebase against the next published snapshot. FRED does not offer automatic retry.
 
 ### 17.4 Execution Cancellation
 
 Preview `Cancel` is defined in Section 16 and preserves dirty intent without creating `ApplyBufferGuard` or acquiring the gate. This section applies only after `apply_finish(... Execute ...)` has consumed the confirmed or empty `PreparedApply`. The Lua progress UI may request cancellation through the running task's internal cancellation handle; this creates no public apply/save entrypoint.
 
-An already-requested cancellation cannot make an old capability abandon newer intent. Apply first validates current initiating View ownership and the sealed View/root/projection/edit-base/planned-root/intent/changedtick authority plus execute witness. Stale validation returns the pre-execution stale outcome, preserves current intent and `'modified'`, and releases `ApplyBufferGuard`. Only after current Execute is accepted may cancellation take the clean path before gate acquisition or the first syscall.
+An already-requested cancellation cannot make an old capability abandon newer intent. Apply first validates the sealed `ApplyAuthorityStamp` plus observed changedtick. Stale validation returns the pre-execution stale outcome, preserves current intent and `'modified'`, and lets Lua release `ApplyBufferGuard`. Only after current Execute is accepted may cancellation take the clean path before gate acquisition or the first syscall.
 
 When accepted cancellation is observed before completion, Apply:
 
-1. stops at the next safe checkpoint and runs no later node;
-2. records completed, cancelled, and unstarted nodes plus known successful internal effects;
-3. has Snapshot apply known successful effects, derive terminal identity, and publish the resulting immutable RootSnapshot;
-4. for cross-filesystem MOVE, Snapshot treats copy success followed by cancellation observed before source deletion starts or before a cancellable deletion completes exactly like source-delete failure: the source retains its NodeId and the destination receives a distinct NodeId, retaining the PendingCopy provisional destination when available and allocating one otherwise; successful deletion followed only by later cancellation observation is Success; a partial cancelled COPY_TREE discovered later receives new NodeIds for unrepresented destination nodes;
-5. abandons cancelled and unstarted initiating intent, even when no syscall had yet run;
-6. returns a clean initiating semantic frame, invalidates overlapping RootSessions, and queues best-effort refresh to discover additional partial effects;
-7. reports execution cancellation and exits through the common terminal path; when the gate was acquired, the post-lock finalizer leaves Apply, releases scan fences, removes the active mutation affected-path fence, and releases the lock.
+1. if it is observed before gate acquisition, revalidates `ApplyAuthorityStamp` and clears initiating ViewIntent atomically under View/RootSession state synchronization, publishes no RootSnapshot, and returns a clean ExecutionCancelled `TerminalProjection` from that same current snapshot;
+2. otherwise stops at the next safe checkpoint and runs no later node;
+3. records completed, cancelled, and unstarted nodes plus known successful internal effects;
+4. has Snapshot apply known successful effects, derive terminal identity, mark scopes that may contain unreported partial effects Partial/RetainedUnverified, and publish the resulting immutable RootSnapshot;
+5. for cross-filesystem MOVE, Snapshot treats copy success followed by cancellation observed before source deletion starts or before a cancellable deletion completes exactly like source-delete failure: the source retains its NodeId and the destination receives a distinct NodeId, retaining the PendingCopy provisional destination when available and allocating one otherwise; successful deletion followed only by later cancellation observation is Success; a partial cancelled COPY_TREE discovered later receives new NodeIds for unrepresented destination nodes;
+6. abandons cancelled and unstarted initiating intent;
+7. returns one clean ExecutionCancelled `TerminalProjection`, invalidates overlapping RootSessions, and queues best-effort refresh to discover additional partial effects;
+8. reports execution cancellation and exits through the common terminal path; when the gate was acquired, the process-level finalizer releases scan fences, removes the active mutation affected-path fence, sets MutationCoordinator to Idle, and releases the lock.
 
-No known successful effect is rolled back. A blocking syscall may complete before the cancellation request is observed. If cancellation is first observed only after the final execution node successfully completed, the result is Success and Section 17.2 applies. Otherwise, before returning write failure, Lua synchronously commits the latest available clean frame, clears `'modified'`, establishes a new undo baseline, and releases `ApplyBufferGuard`, so `:wq` remains open. Refresh failure is reported without restoring abandoned intent or creating an unknown, recovery, reconciliation-required, or apply-blocking state.
+No known successful effect is rolled back. A blocking syscall may complete before the cancellation request is observed. If cancellation is first observed only after the final execution node successfully completed, the result is Success and Section 17.2 applies. Otherwise, before returning write failure, Lua synchronously validates its local write epoch and consumes the latest sealed `TerminalProjection`, clears `'modified'`, establishes a new undo baseline, and releases `ApplyBufferGuard`, so `:wq` remains open. Refresh failure is reported without restoring abandoned intent or creating an unknown, recovery, reconciliation-required, or apply-blocking state.
 
 ### 17.5 Process Kill Or Power Loss
 
@@ -1998,6 +2023,8 @@ Semantics:
 
 ## 20. Internal Modules
 
+The implementation groups files by one state owner rather than creating one ownership boundary per small concept. Pure helpers may remain separate files for testing, but they do not become competing stateful services.
+
 Suggested structure:
 
 ```text
@@ -2007,25 +2034,27 @@ src/
   lib.rs
   native_bridge.rs
   runtime.rs
-  apply.rs
-  root_session.rs
-  snapshot.rs
-  node.rs
-  view.rs
-  intent.rs
-  semantic_frame.rs
-  task.rs
-  scanner.rs
-  metadata.rs
-  watcher.rs
-  coverage.rs
   path.rs
-  planner.rs
-  conflict.rs
-  executor.rs
-  tree_ops.rs
-  symlink.rs
+  node.rs
+  task.rs
   ignore.rs
+  session/
+    mod.rs
+    snapshot.rs
+    scanner.rs
+    metadata.rs
+    watcher.rs
+    coverage.rs
+  view/
+    mod.rs
+    intent.rs
+    semantic_frame.rs
+  planner.rs
+  mutation/
+    mod.rs
+    executor.rs
+    tree_ops.rs
+    symlink.rs
 lua/
   fred/init.lua
   fred/config.lua
@@ -2034,53 +2063,47 @@ lua/
   fred/actions.lua
   fred/keymaps.lua
   fred/lifecycle.lua
-  fred/buffer.lua
-  fred/buffer_projection.lua
-  fred/projection_codec.lua
-  fred/flat_projection.lua
-  fred/projector.lua
-  fred/presentation.lua
+  fred/layout.lua
+  fred/view_projection.lua
+  fred/projection/projector.lua
+  fred/projection/flat.lua
+  fred/buffer_runtime.lua
   fred/columns.lua
   fred/provenance.lua
-  fred/layout.lua
 plugin/
   fred.lua
 ftplugin/
   fred.lua
 ```
 
-The modules expose small internal interfaces with substantial behavior behind them:
+The ownership boundaries are:
 
-- Rust `native_bridge` owns only exact-pair-tested native module registration, Lua/native argument and result conversion, opaque sealed userdata conversion, `AsyncHandle` wakeups, and main-thread event delivery; it does not own FRED buffer APIs or Apply policy;
+- Rust `native_bridge` owns only exact-pair-tested native module registration, Lua/native argument and result conversion, opaque sealed userdata conversion, `AsyncHandle` wakeups, and main-thread event delivery; it owns no FRED buffer API or mutation policy;
 - Rust `path` owns canonical native/session/View path conversion and validation;
-- Rust `node` owns the NodeId type, RootSession-scoped allocator, scope validation, and opaque cross-language serialization; it exposes no lifecycle-encoded ID prefixes and owns no terminal lifecycle realization;
-- Rust `snapshot` owns immutable normalized indexes, directory status, deterministic terminal identity resolution from planned dispositions plus known successful execution effects, and publication of self-consistent RootSnapshots;
-- Rust `root_session` owns shared scan, watcher, coverage, metadata/cache state, exact-root weak registration, task state, and strong/weak lifetime boundaries;
-- Rust `view` owns `root_node_id`, immutable edit base, semantic intent, CommittedProjection, and frame generations without owning a buffer number;
-- Rust `intent` owns CaptureRequest validation and normalized Existing/PendingCreate/PendingCopy desired state;
-- Rust `semantic_frame` applies ViewIntent to RootSnapshot and emits bounded projection-neutral ViewSemanticFrame events;
-- Rust `metadata` owns platform metadata collection and normalized optional values requested by Lua columns and SortSpecs;
-- Rust `planner` is pure and owns validation, final-state normalization, COPY/MOVE/DELETE classification, planned identity dispositions, logical preview data, execution DAG/order, `ValidPlan.affected_paths`, and final-probe expectations;
-- Rust `executor` owns serial no-replace system calls, cooperative safe-checkpoint cancellation, fail-stop behavior, known-successful-effect reporting, and `COMPLETED / FAILED|CANCELLED / UNSTARTED` outcomes; it owns neither affected paths nor View refresh;
-- Rust `apply` is the sole owner of the two-stage `apply_prepare`/`apply_finish` data flow, sealed one-shot `PreparedApply`, gate timing, authority and final-probe checks, process-wide active mutation affected-path fence registration/removal, generic execution-task cancellation coordination, terminal identity-resolution orchestration, overlap invalidation, deterministic publication orchestration, common finalization, and refresh scheduling;
-- Rust `tree_ops` provides the deep cancellable COPY_TREE/DELETE_TREE implementations used only through Executor;
-- Rust `task` is generic bounded worker/event/cancellation plumbing and defines no second Apply transaction or prepared-plan registry;
-- Rust `runtime` owns RootSession/View registration, native handles, lookup facilities, and consultation of active mutation fences at RootSession scan start/publication without owning Apply state transitions;
+- Rust `node` owns NodeId, ScopedNodeId transport, the RootSession-scoped allocator, scope validation, and opaque cross-language serialization; it exposes no lifecycle-encoded ID prefix and owns no terminal lifecycle realization;
+- Rust `session` is the single owner of RootSession state: immutable versioned RootSnapshot and metadata snapshots, off-main-thread candidate construction, scanner/watcher/coverage/cache state, exact-root weak registration, scan generations/tasks, queued scan demand, and strong/weak lifetime boundaries. It owns no Apply state;
+- Rust `session::snapshot` owns normalized indexes, Complete/Partial/Failed directory status, RetainedUnverified propagation, deterministic terminal identity resolution from planned dispositions plus known successful execution effects, and publication of self-consistent RootSnapshots;
+- Rust `view` is the single owner of `root_node_id`, `ViewAuthorityEpoch`, immutable edit base, semantic ViewIntent, CommittedProjection visible set, root status, and frame sequence without owning a buffer number;
+- Rust `view::intent` owns CaptureRequest validation and normalized Existing/PendingCreate/PendingCopy desired state; conflict state belongs to View rebase/intent validation rather than a standalone state owner;
+- Rust `view::semantic_frame` applies ViewIntent to RootSnapshot and emits bounded projection-neutral ViewSemanticFrame events;
+- Rust `planner` is pure and owns validation, final-state normalization, COPY/MOVE/DELETE classification, planned identity dispositions, logical preview data, transient dependency resolution, the final linear execution program, `ValidPlan.affected_paths`, and final-probe expectations;
+- Rust `mutation` is the sole process-level mutation owner. It contains MutationCoordinator, `apply_prepare`/`apply_finish`, sealed `PreparedApply`, `ApplyAuthorityStamp`, `TerminalProjection`, global gate/fence timing, double authority validation, final probes, generic execution cancellation, terminal identity/publication orchestration, overlap invalidation, common finalization, and refresh scheduling;
+- Rust `mutation::executor` owns serial no-replace system calls, cooperative safe-checkpoint cancellation, fail-stop behavior, known-successful-effect reporting, and `COMPLETED / FAILED|CANCELLED / UNSTARTED` outcomes; it receives only the linear execution program and owns neither affected paths nor View refresh;
+- Rust `mutation::tree_ops` provides deep cancellable COPY_TREE/DELETE_TREE implementations used only through Executor; `mutation::symlink` implements the immediate helper through the same coordinator;
+- Rust `task` is generic bounded progress/completion/cancellation plumbing and defines no second mutation transaction or prepared-plan registry;
+- Rust `runtime` owns native RootSession/View handles and lookup facilities and exposes the single MutationCoordinator to scan-start/publication checks without duplicating its state;
 - Lua `config` captures setup defaults, validates Lua-only callback/action/layout/column shapes, and resolves direct/child instance inheritance;
-- Lua `instance` owns the public object, root/config identity, child RootSession lineage decisions, and native View handles;
+- Lua `instance` owns the public object, root/config identity, child RootSession lineage decisions, native View handle, and references to its ViewProjection and BufferRuntime;
 - Lua `registry` owns InstanceId/name/buffer lookup and terminal removal;
-- Lua `actions` and `keymaps` own function-valued actions, context construction, mode/lhs merge, and buffer-local installation;
-- Lua `presentation` owns hidden-file visibility, SortSpec, MaterializationState, NodeId-keyed ExpansionState, presentation generations, the ViewSemanticFrame catalog mirror, and consumption of authoritative terminal NodeId transitions for expansion remapping;
-- Lua `projector` owns hidden subtree filtering, sibling-local sorting, depth-first traversal, and production of the common ProjectedRow sequence;
-- Lua `projection_codec` defines the internal sealed bidirectional codec contract; `flat_projection` is the only version-one implementation;
-- Lua `buffer_projection` owns line rendering/capture, full-line NodeId range extmarks, projection commits, changedtick, authoritative terminal binding/cursor transition consumption, modified state, undo baselines, internal-sync suppression, and synchronous clean outcome commits inside `BufWriteCmd`;
-- Lua `buffer` owns buffer creation and write-command routing, preview/confirmation UI coordination, `ApplyBufferGuard`, write epochs, reentrant-write rejection, coordination of the authoritative terminal transition across presentation and buffer projection, terminal guard release, and the internal execution progress/cancellation control;
-- Lua `columns` owns built-in column definitions, layout, display-width alignment, highlighted chunks, and metadata requirement declarations;
+- Lua `actions` and `keymaps` own function-valued action adapters, context construction, mode/lhs merge, and buffer-local installation; action and command entrypoints delegate to Instance/BufferRuntime logic rather than reimplementing behavior;
+- Lua `view_projection` is the single stateful owner of hidden-file visibility, SortSpec, MaterializationState, NodeId-keyed ExpansionState, presentation generations, the ViewSemanticFrame catalog mirror, ordered projected NodeIds, and terminal expansion remapping. `projection/projector.lua` and `projection/flat.lua` are pure helpers for hidden/sort/DFS projection and version-one flat encode/decode, not state owners or a projection registry;
+- Lua `buffer_runtime` is the sole owner of buffer creation, write-command routing, line rendering/capture, full-line NodeId range extmarks, ProjectionCommit, changedtick, Lua-local write epochs, `ApplyBufferGuard`, preview/confirmation, reentrant-write rejection, cursor/binding reconciliation, modified state, undo baselines, internal-sync suppression, execution progress/cancellation controls, and one-shot joint TerminalProjection consumption;
+- Lua `columns` owns built-in column definitions, display-width alignment, highlighted chunks, and metadata requirement declarations;
 - Lua `provenance` owns `TextYankPost`, register snapshots, `p`/`P` wrappers, inserted-range tracking, and normalized same-session `copy_from` capture;
 - Lua `lifecycle` owns Neovim display reconciliation, Instance state transitions, timers, hidden-group LRU/capacity enforcement, and the idempotent terminal destroy path;
 - Lua `layout` constructs native buffer, float, split, vsplit, and tab displays and returns ordinary window ownership records.
 
-Standalone `apply_gate`, `model`, `preview`, and `report` ownership Modules are intentionally absent. Gate/finalization belongs to `apply`; known-effect transformation and immutable publication belong to `snapshot` under Apply orchestration; preview is Planner output; execution reporting is Executor output. Rust module interfaces remain internal. `src/lib.rs` exposes the native module through `nvim-oxi`; `lua/fred/init.lua` exposes the stable Instance facade. Version one exposes no backend, custom column, renderer, projection-mode, custom ProjectionCodec, PreparedApply, execution-task, or cancellation registration seam.
+Standalone `apply_gate`, per-RootSession Apply state, `projection_codec`, `buffer_projection`, `preview`, and `report` ownership modules are intentionally absent. Gate/finalization belongs to process-level `mutation`; known-effect transformation and immutable publication belong to `session::snapshot` under mutation orchestration; preview is Planner output; execution reporting is Executor output. Rust module interfaces remain internal. `src/lib.rs` exposes the native module through `nvim-oxi`; `lua/fred/init.lua` exposes the stable Instance facade. Version one exposes no backend, custom column, renderer, projection-mode, custom projection interface, PreparedApply, execution-task, or cancellation registration seam.
 
 
 ## 21. Public Configuration
@@ -2169,7 +2192,7 @@ Direct `fred.new(opts)` deep-merges setup defaults with explicit instance option
 
 `sort` is the complete three-field SortSpec described in Section 13. All fields are required, unknown fields are errors, and only the built-in single keys are supported. Arbitrary comparators, multi-key sorting, directory-first options, and configurable missing-value placement are not public version-one features.
 
-Watcher establishment, plan confirmation, no-follow directory-symlink behavior, and the internal FlatProjectionCodec remain automatic and non-configurable in version one. There is no `view_mode`, tree toggle, renderer selector, or custom ProjectionCodec option.
+Watcher establishment, plan confirmation, no-follow directory-symlink behavior, and the internal flat projection remain automatic and non-configurable in version one. There is no `view_mode`, tree toggle, renderer selector, projection interface, or custom projection option.
 
 `cleanup.instance.delay_ms` is a non-negative integer; `0` disables only the hidden-delay timer. `cleanup.instance.group` is a non-empty setup-defined group name. Each `cleanup.groups.<name>.capacity` is a non-negative integer; `0` means that group retains no Hidden instances. Timer expiry and group overflow are the only automatic destroy triggers and both use the same idempotent terminal path.
 
@@ -2191,7 +2214,7 @@ An individual metadata read failure is reported without invalidating the namespa
 
 No filesystem action runs. Validation/final-preflight errors, stale authority, and process-global lock contention are pre-execution outcomes: the buffer remains dirty, edits and undo history are preserved, `ApplyBufferGuard` is released, and errors are attached to affected rows or reported directly. Busy explicitly means another FRED mutation holds the process-global gate; it does not queue or retry the write.
 
-A stale changedtick, View/root/projection generation, intent generation, `edit_base_revision`, or `planned_root_revision` requires a fresh write/prepare. Authority is checked before an already-requested execution cancellation may abandon intent, so a stale old capability/task preserves newer intent rather than clean-syncing it. If final-preflight failure occurs after lock/fence acquisition, the common finalizer leaves Apply, coalesces and schedules queued refresh demand, releases scan-generation fences, removes the process-wide active mutation affected-path fence, and releases the global mutation lock.
+A stale `ApplyAuthorityStamp` or observed changedtick requires a fresh write/prepare. The stamp compactly covers View identity/authority epoch, RootRevision, ProjectionRevision, and the prepared changedtick; Rust checks it before an already-requested execution cancellation may abandon intent and checks it again after lock/fence acquisition. Lua separately rejects a terminal result whose local `ApplyBufferGuard.write_epoch` is no longer current. If post-fence authority validation or final preflight fails, the common finalizer coalesces and schedules queued refresh demand, releases scan-generation fences, removes the process-wide active mutation affected-path fence, sets MutationCoordinator to Idle, and releases the global mutation lock.
 
 ### 22.3 Conflict
 
@@ -2201,9 +2224,9 @@ Typical conflicts are missing sources, changed source kind, occupied destination
 
 ### 22.4 Execution Failure Or Cancellation
 
-On execution failure, Executor stops immediately, reports `COMPLETED / FAILED / UNSTARTED`, and runs no later operation. On accepted execution cancellation observed before completion, it stops at the next safe checkpoint, reports `COMPLETED / CANCELLED / UNSTARTED`, and runs no later operation. A cancellation first observed after the final execution node succeeded is Success. Known successful effects, including successful internal steps of the failed/cancelled node, update the immutable namespace model deterministically; failed/cancelled and unstarted initiating intent is abandoned; Apply returns a clean semantic frame; filesystem refresh remains best effort.
+On execution failure, Executor stops immediately, reports `COMPLETED / FAILED / UNSTARTED`, and runs no later operation. On accepted execution cancellation observed before completion, it stops at the next safe checkpoint, reports `COMPLETED / CANCELLED / UNSTARTED`, and runs no later operation. A cancellation first observed after the final execution node succeeded is Success. Known successful effects, including successful internal steps of the failed/cancelled node, update the immutable namespace model deterministically; affected scopes that may contain unreported effects become Partial/RetainedUnverified; failed/cancelled and unstarted initiating intent is abandoned; Apply returns one sealed clean `TerminalProjection`; filesystem refresh remains best effort.
 
-Neither outcome rolls back known successful work. Cross-filesystem copy success followed by source-delete failure, or cancellation observed after copy success and before deletion starts or before a cancellable deletion completes, leaves the source NodeId at the source and a distinct NodeId at the destination; successful deletion followed only by later cancellation observation is Success. Partial failed/cancelled COPY_TREE discoveries receive new destination NodeIds. Before `BufWriteCmd` returns write failure, Lua synchronously commits the clean frame, clears `'modified'`, establishes the undo baseline, and releases `ApplyBufferGuard`, so `:wq` remains open with a clean buffer. Refresh errors report through Neovim without blocking a later write or creating a recovery, unknown, reconciliation-required, or apply-blocking state.
+Neither outcome rolls back known successful work. Cross-filesystem copy success followed by source-delete failure, or cancellation observed after copy success and before deletion starts or before a cancellable deletion completes, leaves the source NodeId at the source and a distinct NodeId at the destination; successful deletion followed only by later cancellation observation is Success. Partial failed/cancelled COPY_TREE discoveries receive new destination NodeIds. Before `BufWriteCmd` returns write failure, Lua validates its local write epoch and consumes the sealed `TerminalProjection` through one non-reentrant one-shot critical section, clears `'modified'`, establishes the undo baseline, and releases `ApplyBufferGuard`, so `:wq` remains open with a clean buffer. Refresh errors report through Neovim without blocking a later write or creating a recovery, unknown, reconciliation-required, or apply-blocking state.
 
 ### 22.5 Instance, Layout, Or Attach Error
 
@@ -2213,7 +2236,7 @@ A layout-open failure rolls back only resources created by that open attempt. If
 
 ### 22.6 Presentation Error
 
-Immediate public-method validation errors and a different SortSpec on a dirty View throw directly to the caller and leave committed presentation state unchanged; identical normalized values are no-ops. During scheduled frame processing, an `is_hidden_file` exception, non-boolean return, codec error, stale frame token, unknown/duplicate NodeId, or ProjectionCommit rejection propagates as the direct Neovim Lua/native error. FRED does not add a projection lease, renderer rollback protocol, recovery state, promise-like result, or automatic retry. Classification or codec failure before rendering leaves the previous committed projection intact; render or commit failures are fail-fast and require an ordinary later refresh or reopen if the user wants to retry.
+Immediate public-method validation errors and a different SortSpec on a dirty View throw directly to the caller and leave committed presentation state unchanged; identical normalized values are no-ops. During scheduled frame processing, an `is_hidden_file` exception, non-boolean return, flat encode/decode error, stale frame token, unknown/duplicate NodeId, or ProjectionCommit rejection propagates as the direct Neovim Lua/native error. FRED does not add a projection lease, renderer rollback protocol, recovery state, promise-like result, or automatic retry. Classification or flat projection failure before rendering leaves the previous committed projection intact; render or commit failures are fail-fast and require an ordinary later refresh or reopen if the user wants to retry.
 
 ## 23. Testing Strategy
 
@@ -2234,8 +2257,10 @@ Immediate public-method validation errors and a different SortSpec on a dirty Vi
 - sealed ViewFrameToken currency and stale/mixed frame-event rejection;
 - immutable initial and final namespace-probe specifications for sources, destinations, existing parents, planned-parent chains, nearest ancestors, and symlink traversal;
 - pure Planner normalization for create, copy, copy-tree, move, delete, delete-tree, replacement, multiple provenance destinations, planned identity dispositions, rename cycles, conditional ordering, logical preview, affected paths, and final-probe expectations;
-- sealed `PreparedApply` one-shot consumption, preview immutability, duplicate/replay rejection, stale older preparation, authority-before-cancellation ordering, explicit cancel/drop memory release, and absence of a prepared-plan registry;
-- common post-lock finalization, process-wide active mutation affected-path fencing, serial fail-stop execution, safe-checkpoint cancellation, cancellation-after-final-success classification, deterministic known-effect publication, and no later node after the first failure or accepted cancellation;
+- sealed `PreparedApply` one-shot consumption, preview immutability, duplicate/replay rejection, stale older preparation, preview-drop memory release, and absence of a prepared-plan registry;
+- `ApplyAuthorityStamp` coverage, every accepted CaptureRequest—including semantically identical same-changedtick capture—advancing IntentGeneration and ViewAuthorityEpoch, validation before cancellation, revalidation after gate/fence registration, Lua-local write-epoch exclusion from Rust authority, and stale reason reporting;
+- process-level MutationCoordinator ownership with no per-RootSession Apply state, common post-lock finalization, active affected-path fencing, serial fail-stop execution, safe-checkpoint cancellation, cancellation-after-final-success classification, deterministic known-effect publication, and no later node after the first failure or accepted cancellation;
+- sealed `TerminalProjection` frame/transition consistency, one-shot joint consumption without independent replay, presentation fail-fast/no-rollback behavior, and Partial/RetainedUnverified marking when failed or cancelled operations may have unreported effects;
 - metadata-generation/source-revision checks and NodeId-plus-observed-path binding;
 - RootSession Weak registry behavior, View/task strong ownership, cancellation, and natural final release.
 
@@ -2244,26 +2269,26 @@ Immediate public-method validation errors and a different SortSpec on a dirty Vi
 - complete SortSpec normalization, wholesale replacement, equality no-op, missing-values-last, and fixed tie-breakers;
 - hidden-file callback inputs, boolean enforcement, hidden-directory subtree propagation, and cache invalidation;
 - sibling-local sorting followed by depth-first traversal for every sort key and direction, with every materialized directory subtree contiguous;
-- identical ProjectedRow NodeId order feeding FlatProjectionCodec and a test-only tree-shaped codec fixture;
+- identical ProjectedRow NodeId order feeding the internal flat functions and a test-only tree-shaped projection fixture without a runtime projection interface;
 - MaterializationState baseline depth, NodeId-keyed expansions, recursive depth, explicit includes, and coverage-request generation;
 - same-instance root-node change retaining expansion, parent/child subtree expansion snapshot, later independence, directory MOVE retention, and COPY non-inheritance;
 - catalog mirror assembly from bounded frame events and stale/mixed token rejection;
-- FlatProjectionCodec canonical line encode/decode and no public projection-mode or codec registry;
-- BufferProjectionEngine full-line NodeId range extmarks, exact gravity, invalidation, undo restoration, internal-sync suppression, duplicate binding rejection, and unique-path rebind only;
-- unbound-row NodeId allocation before capture; absence of capture-time or preview-time rebinding; and atomic consumption of authoritative terminal NodeIdTransition values for successful PendingCopy-derived MOVE, including bindings, cursor, and expansion remap;
+- canonical flat line encode/decode and no public projection-mode, runtime projection interface, or registry;
+- BufferRuntime full-line NodeId range extmarks, exact gravity, invalidation, undo restoration, internal-sync suppression, duplicate binding rejection, and unique-path rebind only;
+- unbound-row NodeId allocation before capture; absence of capture-time or preview-time rebinding; and one-shot joint `TerminalProjection` consumption for successful PendingCopy-derived MOVE, including bindings, cursor, expansion remap, render, and ProjectionCommit, with fail-fast/no-rollback behavior for presentation errors;
 - `TextYankPost`, register content/type qualification, `p`/`P` native behavior, same-session parent/child provenance, independent-session rejection, and PendingCopy capture;
 - Lua columns, virtual-text alignment, display-cell widths, placeholders, metadata requirements, and no editable-text pollution;
-- `ApplyBufferGuard` reentrant-write/edit prevention, execute-witness changedtick/write epochs, synchronous clean-frame render/ProjectionCommit/modified-state/undo-baseline/cursor handling inside `BufWriteCmd`, guard release on every success/abort/error/destruction path, and destroyed/generation-mismatched no-resurrection behavior;
+- `ApplyBufferGuard` reentrant-write/edit prevention, Rust-observed changedtick, Lua-local write epochs that never become Rust authority, synchronous TerminalProjection render/ProjectionCommit/modified-state/undo-baseline/cursor handling inside `BufWriteCmd`, guard release on every success/abort/error/destruction path, and destroyed/generation-mismatched no-resurrection behavior;
 - Created/Open/Hidden/Destroyed lifecycle, cleanup timers/group LRUs, configuration inheritance, callbacks, keymaps, and layouts.
 
 ### 23.3 Integration Tests
 
-- exact-pair native build/load, bounded worker events, main-thread delivery, and absence of Rust FRED-buffer calls;
-- recursive and selectively materialized scanning into immutable normalized RootSnapshots;
-- one snapshot publication only after all requested scopes are terminal;
+- exact-pair native build/load, bounded progress/completion events, main-thread delivery, and absence of Rust FRED-buffer calls;
+- recursive and selectively materialized scanning into immutable normalized RootSnapshots built off the main thread without per-node main-thread candidate assembly;
+- one candidate handoff and at most one snapshot publication only after all requested scopes are terminal;
 - Complete scopes authoritatively replacing child membership while Partial/Failed scopes retain prior unobserved nodes as RetainedUnverified;
 - dirty rebase, conflict detection, projection, and descendant-root status treating RetainedUnverified nodes as Unknown rather than deleted;
-- RootSnapshot-to-ViewSemanticFrame event delivery, Lua catalog assembly, common projection, FlatProjectionCodec rendering, and ProjectionCommit;
+- RootSnapshot-to-ViewSemanticFrame event delivery, Lua catalog assembly, common projection, flat rendering, and ProjectionCommit;
 - arbitrary frame/catalog omission from hidden, ignore, depth, collapse, cancellation, failure, limits, or watcher gaps never generating deletion;
 - removal of a NodeId that belonged to CommittedProjection generating deletion intent;
 - different exact-root Views sharing snapshots; parent/child and navigate lineage sharing one RootSession and NodeIds; independent nested direct roots remaining separate;
@@ -2275,11 +2300,11 @@ Immediate public-method validation errors and a different SortSpec on a dirty Vi
 - watcher-driven clean refresh and dirty semantic rebase across same and overlapping sessions;
 - ordinary CREATE, MOVE, DELETE, COPY, REPLACE, COPY_TREE, DELETE_TREE, descendant evacuation, and directory-row suppression;
 - normal yank/put provenance, `gp`, deterministic `_N` names, multiple copy destinations, and cross-session rejection;
-- `apply_prepare` capture/probe/Planner flow, Planner-owned operation classification and identity dispositions, sanitized preview, sealed capability consumption, old-token staleness, authority validation before pre-gate cancellation, and repeated final preflight for missing sources, wrong kinds, occupied destinations, planned parents, non-directory ancestors, and symlink traversal;
-- destination races using no-replace behavior, Busy lock contention, a process-wide affected-path fence registered before session enumeration/first syscall, existing-generation invalidation, and a newly created overlapping RootSession blocked at scan start/publication;
+- `apply_prepare` capture/probe/Planner flow, Planner-owned operation classification and identity dispositions, sanitized preview, sealed capability consumption, old-token staleness after a later semantically identical capture, `ApplyAuthorityStamp` validation before pre-gate cancellation and again after fence registration, and repeated final preflight for missing sources, wrong kinds, occupied destinations, planned parents, non-directory ancestors, and symlink traversal;
+- destination races using no-replace behavior, Busy lock contention, one process-level MutationCoordinator with no RootSession Apply state, an affected-path fence registered before session enumeration/first syscall, existing-generation invalidation, and a newly created overlapping RootSession blocked at scan start/publication;
 - same- and cross-filesystem file/directory MOVE, including successful provisional-to-source terminal transition, source-delete failure and copy-complete/delete-cancellation identity splitting, PendingCopy provisional retention for split destinations, and allocation for direct Existing-path split destinations;
 - a completed PendingCopy-derived MOVE followed by a later-node failure or cancellation: publish the source NodeId at the destination, retire the provisional ID, emit exactly one authoritative transition, synchronously remap binding/cursor/expansion, and then return write failure without rolling back that completed MOVE;
-- COPY_TREE failure and execution cancellation before gate, before first syscall, and at safe checkpoints; cancellation after final-node success classified as Success; completed/failed-or-cancelled/unstarted reporting; synchronous clean initiating commit; and best-effort discovery of partial effects;
+- COPY_TREE failure and execution cancellation before gate, before first syscall, and at safe checkpoints; pre-gate cancellation publishing no RootSnapshot; cancellation after final-node success classified as Success; completed/failed-or-cancelled/unstarted reporting; Partial/RetainedUnverified affected scopes; sealed TerminalProjection commit; and best-effort discovery of partial effects;
 - metadata-only updates, Lua column refresh, clean sibling reorder, dirty real-row freeze, and reapplication on becoming clean;
 - reveal through ignored/uncovered/hidden ancestors without changing root;
 - successful and failed `:FredLink` global-lock release and overlapping refresh.
@@ -2289,14 +2314,14 @@ Immediate public-method validation errors and a different SortSpec on a dirty Vi
 - real `filetype=fred`, `buftype=acwrite` buffers rendered exclusively by Lua;
 - no `/NNN` identity prefix or `../` row and only complete View-relative paths in version-one editable lines;
 - buffer-local `BufWriteCmd`, `FileWriteCmd`, and `FileAppendCmd` validation for current/Open/displayed/exact-URI/full-buffer rules;
-- synchronous Lua semantic capture followed by `apply_prepare`, immutable preview/confirmation, and synchronous clean frame render/ProjectionCommit with `'modified' = false` before `BufWriteCmd` returns for empty, success, execution failure, and accepted execution cancellation;
+- synchronous Lua semantic capture followed by `apply_prepare`, immutable preview/confirmation, and one-shot TerminalProjection render/ProjectionCommit with `'modified' = false` before `BufWriteCmd` returns for empty, success, execution failure, and accepted execution cancellation;
 - invalid/conflicted preparation, dirty-preserving preview `Cancel`, empty-plan execute witness, sealed-token replay rejection, stale old task plus already-requested cancellation, Busy lock contention, final-preflight failure, Execute accepted plus cancellation before gate/first syscall, and execution progress cancellation;
 - real Neovim 0.12.4 `:wq`: successful/empty writes synchronously clear modified state and exit, while execution failure/cancellation synchronously clear modified state then return write failure and remain open; `ApplyBufferGuard` late-edit protection and release on every path; immediate Hidden cleanup; destroyed/generation-mismatched no-resurrection; cursor and undo-baseline behavior;
 - actual range-extmark behavior under edit, delete, move, yank, put, undo, redo, internal render, sort, refresh, and cursor reconciliation;
 - large-frame bounded Lua classification, sibling sorting, DFS projection, rendering, and event-loop progress;
 - columns and metadata refresh without changing path text or filesystem intent;
 - native layouts, multi-window displays, FileType/on_attach ordering, action contexts, registry lookup, cleanup races, and hidden-buffer reopening;
-- absence of public tree mode, projection toggle, renderer selector, custom codec registration, or compatibility alias.
+- absence of public tree mode, projection toggle, renderer selector, runtime projection interface/registration, or compatibility alias.
 
 ### 23.5 Property Tests
 
@@ -2312,7 +2337,7 @@ Randomly generated snapshots, semantic frames, captures, and intents must preser
 - accepted ProjectionCommit NodeIds are a unique subset of one current frame;
 - projection absence never authorizes deletion;
 - user removal affects only NodeIds from the initiating CommittedProjection;
-- hidden, sort, depth, expansion, collapse, renderer choice, layout, and lifecycle do not change semantic intent by themselves;
+- hidden, sort, depth, expansion, collapse, flat presentation rendering, layout, and lifecycle do not change semantic intent by themselves;
 - no duplicate final destinations and no operation outside the View root;
 - provenance copies precede removed-source deletion;
 - directory move/copy never targets itself or a descendant;
@@ -2321,7 +2346,7 @@ Randomly generated snapshots, semantic frames, captures, and intents must preser
 - no execution node runs after the first failure or accepted cancellation, while cancellation observed only after final-node success preserves Success;
 - successful logical MOVE leaves one NodeId at the destination, while copy-success/delete-failure or copy-success/delete-cancellation leaves distinct source and destination NodeIds and partial failed/cancelled COPY_TREE discovery creates new destination NodeIds;
 - a scan generation publishes at most one immutable snapshot after all scopes terminate; every existing or future RootSession consults the process-wide active mutation affected-path fence at scan start and publication and cannot publish an overlap across it;
-- every post-lock outcome coalesces and schedules queued refresh demand, leaves Apply, releases scan-generation fences, removes the process-wide active mutation affected-path fence, and releases the process-global mutation gate;
+- every post-lock outcome coalesces and schedules queued refresh demand, releases scan-generation fences, removes the process-wide active mutation affected-path fence, sets the process-level MutationCoordinator to Idle, and releases the process-global mutation gate;
 - View/task references and sealed capability ownership, not registries or expansion state, determine lifetime; dropped or consumed PreparedApply values release plan memory.
 
 ## 24. Performance Requirements
@@ -2330,16 +2355,16 @@ Randomly generated snapshots, semantic frames, captures, and intents must preser
 - Coverage, depth, NodeId-keyed expansion, ignore, or explicit refresh changes cancel obsolete scan generations; same-session `root_node_id` changes invalidate obsolete View frames without replacing the RootSession.
 - Late events from cancelled generations are ignored.
 - Large COPY_TREE and cross-filesystem MOVE operations run on worker threads through deep operation modules and check execution cancellation between entries/internal steps and at other safe checkpoints; an uninterruptible blocking syscall may finish before cancellation is observed, and cancellation first observed only after final-node success remains Success.
-- Scan progress may be displayed while candidate nodes remain internal; editable node projection begins only from a ViewSemanticFrame built after atomic RootSnapshot publication.
+- Scan progress may be displayed while a worker-owned candidate snapshot remains internal; the main thread receives one terminal candidate handoff, and editable node projection begins only from a ViewSemanticFrame built after atomic RootSnapshot publication.
 - Lua consumes bounded ViewSemanticFrame batches and performs cancellable hidden classification, sibling sorting, and depth-first traversal in bounded main-thread slices that yield observable event-loop progress; it may yield between slices, but only a completed current frame is rendered and committed.
 - ProjectionCommit requests are sealed-frame-bound and reject stale tokens or unknown/duplicate NodeIds; a stale presentation generation cancels before Lua renders or commits a newer projection.
 - Re-rendering preserves cursor by NodeId when possible.
 - Exact-root Views and explicit parent/child/navigate lineage Views share RootSession snapshot and watcher data; independent overlapping direct roots remain separate, consult the process-wide active mutation affected-path fence at scan start/publication, and use post-terminal overlap invalidation.
-- Per-generation scan work, Rust semantic-frame construction, each Lua catalog mirror, and common projection scale linearly with that View's covered nodes, while a still-live RootSession cache may scale with scopes visited across many generations rather than only current View coverage.
+- Per-generation scan work, Rust semantic-frame construction, each Lua catalog mirror, and common projection scale linearly with that View's covered nodes. ProjectedRow records are transient; after rendering Lua retains the catalog, ordered NodeIds, and buffer bindings rather than a second full row object graph. A still-live RootSession cache may scale with scopes visited across many generations rather than only current View coverage.
 - Obsolete snapshot versions are released when no View or active task strongly references them; the current snapshot drops with its RootSession.
 - Stat metadata is fetched only for columns and Lua SortSpecs that require it; metadata-only refresh must not trigger unnecessary namespace planning.
 - Metadata sorting may reorder only clean Views; dirty Views freeze sibling-local real-line orders while virtual columns continue to refresh, then reapply the already-current sort and DFS traversal when clean.
-- RootSession provisional task-owned state and dropped/consumed PreparedApply plan data are released promptly through ownership; `max_entries`/`max_directories` and bounded channels/batches constrain each requested generation, not cumulative cache retained by a still-live RootSession.
+- RootSession provisional task-owned candidate state and dropped/consumed PreparedApply plan data are released promptly through ownership; `max_entries`/`max_directories`, bounded progress channels, and bounded ViewSemanticFrame batches constrain each requested generation, not cumulative cache retained by a still-live RootSession.
 - Instance window bookkeeping is proportional to actual displays and does not duplicate scan/snapshot data.
 - Lua Instance cleanup uses at most one timer per Hidden Instance plus O(1) group-LRU membership updates; redisplay cancels/removes them without polling keyboard activity, and capacity overflow evicts oldest Hidden instances.
 - native Lua layout work remains outside scan event draining and the Rust filesystem critical path.
@@ -2350,8 +2375,8 @@ Randomly generated snapshots, semantic frames, captures, and intents must preser
 All Section 26 acceptance criteria define the version-one contract. Development proceeds through runnable internal milestones:
 
 ```text
-M0  exact-pair native bridge, Lua Instance lifecycle, BufferProjectionEngine, and empty View
-M1  NodeId RootSnapshot, bounded ViewSemanticFrame delivery, common projector, FlatProjectionCodec, and metadata columns
+M0  exact-pair native bridge, Lua Instance lifecycle, single-owner BufferRuntime, and empty View
+M1  NodeId RootSnapshot, off-main-thread scan candidate handoff, bounded ViewSemanticFrame delivery, common projector, flat projection, and metadata columns
 M2  shared RootSession lineage, coverage/watchers, NodeId expansion, navigation, child Views, dirty edit bases, and rebase
 M3  semantic capture, NodeId extmarks, same-session provenance, ViewIntent, initial probes, pure Planner, sealed PreparedApply, and preview
 M4  two-stage write integration, ApplyBufferGuard, global mutation runner, cancellable Executor, deterministic publication, and terminal reporting
@@ -2363,22 +2388,22 @@ The implementation sequence is:
 
 1. Establish the Cargo workspace, exact Neovim 0.12.4/`nvim-oxi` candidate, native module/`AsyncHandle` bridge compatibility spike, Linux/Windows build paths, local build helper, native loader, and headless Neovim harness. Rust buffer access is not part of the native bridge.
 2. Implement Lua configuration capture, direct/child inheritance, immutable resolved options, runtime presentation getters/setters, registry/name lookup, function-valued actions/keymaps, `vim.b.fred`, FileType ordering, attach callbacks, native layouts, and Instance cleanup.
-3. Implement Lua `BufferProjectionEngine`, internal sealed ProjectionCodec contract, FlatProjectionCodec, line rendering/capture, NodeId binding specs, virtual decorations, changedtick, cursor, modified state, undo baselines, and internal-sync suppression against a temporary mock semantic frame.
+3. Implement Lua `view_projection` plus pure `projection/projector.lua` and `projection/flat.lua`, then implement the single-owner `BufferRuntime` for line rendering/capture, NodeId binding specs, virtual decorations, changedtick, Lua-local write epochs, cursor, modified state, undo baselines, and internal-sync suppression against a temporary mock semantic frame. Do not introduce a general projection interface.
 4. Implement Rust RootSessionId/ViewId/NodeId allocation, opaque namespaced NodeId serialization for Lua, canonical path algebra, session root NodeId, normalized immutable RootSnapshot, `nodes_by_id`, `children_by_parent`, path indexes, directory status, and exact-root Weak registry.
-5. Implement worker channels, bounded scan/metadata events, cancellation, generation checks, `AsyncHandle` re-wake, and one atomic RootSnapshot publication after all requested scopes are terminal.
-6. Implement Rust View with movable `root_node_id`, semantic ViewIntent, CommittedProjection, ViewSemanticFrame construction, sealed frame tokens, bounded frame events, and Lua catalog-mirror assembly.
+5. Implement worker-owned scan/metadata candidate construction, bounded progress plus one completion handoff, cancellation, generation checks, `AsyncHandle` re-wake, and one atomic RootSnapshot publication after all requested scopes are terminal.
+6. Implement Rust View with movable `root_node_id`, `ViewAuthorityEpoch`, semantic ViewIntent, set-based CommittedProjection, ViewSemanticFrame construction, sealed frame tokens, bounded frame events, and Lua catalog-mirror assembly.
 7. Implement Lua common projector: hidden-directory propagation, sibling-local SortSpec ordering, depth-first traversal, baseline materialization, NodeId-keyed ExpansionState, explicit includes, coverage-request generation, and Lua columns/metadata requirements.
 8. Implement exact-root and explicit parent/child/navigate RootSession sharing rules, same-session path rebasing, child subtree expansion snapshots, independent overlapping sessions, reveal, directory-symlink leaf rejection, watchers, and overlap invalidation.
 9. Add immutable dirty edit bases, semantic three-way rebase, frame-level conflict/validation nodes, clean/dirty sibling-order freeze behavior, and non-confirmable diagnostics.
-10. Add full-line Lua range extmarks, Rust NodeId allocation for unbound rows, `:FredNew`, FlatProjectionCodec semantic capture, Lua `TextYankPost`, `p`/`P` wrappers, same-session provenance, `gp`, and directory-row descendant suppression through ViewIntent.
-11. Implement immutable initial/final namespace-probe specifications and the pure Planner with both revisions, final-state COPY/MOVE/DELETE classification, planned identity dispositions, logical preview data, final-probe expectations, COPY_TREE/DELETE_TREE, nested normalization, descendant evacuation, replacement validation, collision checks, and logical NodeId preservation.
-12. Implement the deep Rust `apply` module and internal `apply_prepare`: CaptureRequest validation, ViewIntent update, initial probes, Planner invocation, sanitized optional preview, sealed one-shot PreparedApply userdata, no prepared-plan registry, and explicit cancel/drop release.
-13. Build synchronous current-buffer `acwrite`/`BufWriteCmd` integration with `apply_finish`, add `FileWriteCmd`/`FileAppendCmd` rejection handlers, Lua `ApplyBufferGuard`/write epochs, confirmation, empty-plan execute witness, duplicate-token rejection, authority-before-cancellation stale checks, authoritative terminal NodeIdTransition consumption across presentation and buffer projection, synchronous clean-frame commit and modified-state transition, real Neovim 0.12.4 `:wq` behavior, and terminal guard release.
-14. Implement the process-global mutation runner, `ValidPlan.affected_paths`, process-wide active mutation fence registration before session enumeration/first syscall, existing/future RootSession scan-start/publication checks, common finalization/removal, serial fail-stop Executor, safe-checkpoint execution cancellation, final-node-success classification, deep tree operations, no-replace destinations, rename cycles, deterministic Snapshot terminal identity resolution from planned dispositions plus known effects, Apply-owned overlap refresh, cross-filesystem success identity preservation, and copy-success/delete-failure-or-cancellation identity splitting.
+10. Add full-line Lua range extmarks, Rust NodeId allocation for unbound rows, `:FredNew`, flat semantic capture, Lua `TextYankPost`, `p`/`P` wrappers, same-session ScopedNodeId provenance, `gp`, and directory-row descendant suppression through ViewIntent.
+11. Implement immutable initial/final namespace-probe specifications and the pure Planner with `ApplyAuthorityStamp`, final-state COPY/MOVE/DELETE classification, planned identity dispositions, transient dependency resolution, a final linear execution program, logical preview data, final-probe expectations, COPY_TREE/DELETE_TREE, nested normalization, descendant evacuation, replacement validation, collision checks, and logical NodeId preservation.
+12. Implement the process-level Rust `mutation` module and internal `apply_prepare`: CaptureRequest validation, ViewIntent update, initial probes, Planner invocation, sanitized optional preview, sealed one-shot PreparedApply userdata, one MutationCoordinator, no per-RootSession Apply state, no prepared-plan registry, and drop-based preview cancellation.
+13. Build synchronous current-buffer `acwrite`/`BufWriteCmd` integration with `apply_finish`, add `FileWriteCmd`/`FileAppendCmd` rejection handlers, Lua `ApplyBufferGuard`/local write epochs, confirmation, empty-plan execute witness, duplicate-token rejection, `ApplyAuthorityStamp` validation before cancellation, sealed `TerminalProjection` consumption by BufferRuntime, synchronous clean commit and modified-state transition, real Neovim 0.12.4 `:wq` behavior, and terminal guard release.
+14. Complete MutationCoordinator with `ValidPlan.affected_paths`, active mutation fence registration before session enumeration/first syscall, post-fence authority revalidation, existing/future RootSession scan-start/publication checks, common finalization/removal, serial fail-stop Executor over the linear program, safe-checkpoint execution cancellation, final-node-success classification, deep tree operations, no-replace destinations, rename cycles, deterministic Snapshot terminal identity resolution from planned dispositions plus known effects, Partial/RetainedUnverified marking for potentially unreported effects, overlap refresh, cross-filesystem success identity preservation, and copy-success/delete-failure-or-cancellation identity splitting.
 15. Add immediate `:FredLink` through the common mutation runner, buffer-directory resolution, directory-symlink target opening as a separate RootSession, and full failure/cancellation-injection coverage.
 16. Run complete configuration, lifecycle, layout, buffer, projection, navigation, mutation, multi-View/session, watcher, metadata, Linux/Windows, large-tree, prepared-capability, and execution-cancellation suites before declaring version one stable.
 
-Each phase must preserve read-only usability before mutation support is enabled. Version one does not implement or expose a tree codec, projection toggle, renderer selector, or custom codec registration.
+Each phase must preserve read-only usability before mutation support is enabled. Version one does not implement or expose a tree projection, projection toggle, renderer selector, runtime projection interface, or custom registration.
 
 ## 26. Acceptance Criteria
 
@@ -2386,11 +2411,11 @@ Version one is ready when:
 
 1. FRED builds locally as a required Rust `cdylib` and loads on Linux and Windows for every exact allowlisted Neovim 0.12/`nvim-oxi` pair; native module registration, conversion, `AsyncHandle`, and event-delivery compatibility pass, while missing native libraries produce actionable hard errors.
 2. Rust performs no direct FRED View buffer, extmark, virtual-text, cursor, changedtick, modified-state, or undo operation.
-3. The Lua facade exposes the approved Instance, presentation, refresh, registry, and function-valued action APIs with no public apply/save method, tree mode, projection toggle, renderer selector, placeholder `view_mode`, custom codec registration, or compatibility alias.
-4. `:Fred` opens a responsive version-one FlatProjectionCodec buffer with `filetype=fred`, `buftype=acwrite`, complete View-relative paths, no `/NNN` identity prefix, and no `../` row.
+3. The Lua facade exposes the approved Instance, presentation, refresh, registry, and function-valued action APIs with no public apply/save method, tree mode, projection toggle, renderer selector, placeholder `view_mode`, runtime projection interface/registration, or compatibility alias.
+4. `:Fred` opens a responsive version-one flat-projection buffer with `filetype=fred`, `buftype=acwrite`, complete View-relative paths, no `/NNN` identity prefix, and no `../` row.
 5. One opaque RootSession-scoped NodeId type represents existing files/directories/symlinks, PendingCreate nodes, PendingCopy nodes, dirty moved nodes, and conflicted nodes; Lua receives an unparsed namespaced string that cannot collide with editable filenames and does not encode lifecycle; successful CREATE/COPY keeps its pending NodeId, while a unique removed-source PendingCopy destination is rebound to the source NodeId and retires its provisional NodeId only after terminal effects prove the logical MOVE succeeded.
 6. Every published RootSnapshot has one root NodeId and self-consistent `nodes_by_id`, `children_by_parent`, path index, one-parent membership, directory status, and symlink-leaf invariants.
-7. A scan generation publishes exactly one immutable RootSnapshot only after every requested scope is terminal; Complete directory membership may remove absent prior children, while Partial/Failed membership remains non-authoritative, carries prior unobserved nodes as RetainedUnverified, and cannot imply conflict, deletion, or Missing root.
+7. A scan worker builds one candidate RootSnapshot off the main thread, emits bounded progress plus one terminal candidate handoff, and publishes at most one immutable RootSnapshot only after every requested scope is terminal; Complete directory membership may remove absent prior children, while Partial/Failed membership remains non-authoritative, carries prior unobserved nodes as RetainedUnverified, and cannot imply conflict, deletion, or Missing root.
 8. Exact-root direct Views share RootSession state; same-instance descendant navigation and explicit parent/child lineage share the existing RootSession and NodeIds; independent overlapping direct roots are not automatically merged.
 9. Same-instance navigation changes only View `root_node_id`, re-bases View-relative paths, preserves NodeIds and NodeId-keyed expansion, keeps the buffer/Instance/View/RootSession, and requires a clean View; a same-session MOVE of a dirty View's root NodeId follows its new path and carries desired View-relative intent with it, while only authoritative root deletion produces the non-confirmable Missing-root diagnostic and blocks planning/navigation without silent rebinding.
 10. A child Instance inside the parent session shares that RootSession, uses the selected directory NodeId as root, snapshots only parent expansion entries in that subtree, evolves independently afterward, and leaves the parent dirty buffer intact.
@@ -2398,23 +2423,23 @@ Version one is ready when:
 12. Rust applies RootSnapshot plus ViewIntent into a projection-neutral ViewSemanticFrame containing normalized parent/child membership for clean, dirty, pending, moved, conflict, validation, suppressed, and evacuated state.
 13. ViewSemanticFrame events are bounded and token-bound; Lua rejects stale or mixed frame batches.
 14. Lua assembles a catalog mirror, applies hidden-directory filtering, sorts only direct sibling groups, performs depth-first traversal, and keeps every materialized directory subtree contiguous.
-15. Flat and a test-only tree-shaped codec fixture consume the same ProjectedRow NodeId order; only line encoding/decoding differs.
-16. Version one implements only the internal sealed FlatProjectionCodec and exposes no public renderer extension seam.
-17. Lua BufferProjectionEngine owns full-line NodeId range extmarks, rendering/capture, decorations, cursor reconciliation, changedtick, modified state, undo baselines, and internal-sync suppression.
+15. Internal flat functions and a test-only tree-shaped projection fixture consume the same ProjectedRow NodeId order; only line encoding/decoding differs, and no runtime projection interface is required.
+16. Version one implements only internal flat encode/decode functions and exposes no public renderer or projection extension seam.
+17. One Lua BufferRuntime owns full-line NodeId range extmarks, rendering/capture, decorations, cursor reconciliation, changedtick, Lua-local write epochs, ApplyBufferGuard, modified state, undo baselines, internal-sync suppression, and one-shot joint TerminalProjection consumption; presentation errors remain fail-fast without transactional rollback.
 18. Unbound rows receive Rust-allocated NodeIds before semantic capture; duplicate, unknown, foreign-session, or stale bindings are rejected.
 19. Lua semantic capture submits only NodeId, desired View-relative path candidate, kind, optional same-session `copy_from`, projection revision, and changedtick; Rust repeats path and semantic validation and never parses buffer text.
-20. Rust records CommittedProjection from a current ViewFrameToken, unique ordered NodeIds, and changedtick; only removal of a bound Existing NodeId from that projection may generate deletion intent.
-21. Ignore, hidden-file display, sibling sort, depth, expansion, collapse, renderer choice, scan cancellation/failure/limits, reveal, layout, and watcher gaps never imply deletion.
+20. Rust validates a current ViewFrameToken, unique ordered NodeIds, and changedtick, then records CommittedProjection as a visible NodeId set without duplicating Lua presentation order; only removal of a bound Existing NodeId from that set may generate deletion intent.
+21. Ignore, hidden-file display, sibling sort, depth, expansion, collapse, flat presentation rendering, scan cancellation/failure/limits, reveal, layout, and watcher gaps never imply deletion.
 22. `TextYankPost` and Lua `p`/`P` wrappers preserve native behavior, qualify register content/type, attach provenance only within one RootSession, and treat unqualified or foreign insertions as PendingCreate.
 23. Parent/child Views sharing one RootSession may exchange provenance; independent overlapping sessions may not.
 24. Source retained produces COPY/COPY_TREE; one destination with removed source makes Planner produce MOVE plus a planned identity disposition without mutating capture or Lua state; only a successfully realized terminal MOVE rebinds the provisional destination to the source NodeId; multiple destinations with removed source retain destination NodeIds, produce copies, then delete the source.
 25. `gp` copies selected top-level entries into a directory and generates deterministic `_N` destinations.
 26. Dirty Views retain immutable edit bases; external namespace changes refresh clean Views and semantically rebase dirty Views without overwriting intent.
 27. Metadata columns are Lua virtual text, never editable syntax, handle unavailable values with placeholders, and request only required Rust metadata fields.
-28. Metadata batches independently reject stale metadata generation, source RootRevision, NodeId, or observed path; metadata changes never create namespace conflict or deletion intent.
+28. Completed metadata patches independently reject stale metadata generation, source RootRevision, NodeId, or observed path; metadata changes never create namespace conflict or deletion intent.
 29. Metadata-backed sorting may reorder only clean sibling groups; dirty Views freeze real sibling orders while virtual columns continue to refresh.
 30. Watcher establishment is automatic; failure is visible but does not globally block unrelated valid plans.
-31. RootSession Weak registry entries do not retain sessions; Views/tasks do, last-View detach cancels work with no consumers, and final strong-reference release drops snapshots, caches, coverage, metadata, and watchers without a Rust LRU or sweeper.
+31. RootSession Weak registry entries do not retain sessions; Views/tasks do, last-View detach cancels work with no consumers, and final strong-reference release drops snapshots, caches, coverage, metadata, and watchers without a Rust LRU or sweeper. RootSession has no Apply state; one process-level MutationCoordinator is the sole mutation-state authority.
 32. Ordinary edits and `:FredNew file`/`:FredNew dir` express create, move, rename, replace, and delete from final desired state.
 33. DELETE_TREE and COPY_TREE each remain one logical operation without advance descendant enumeration.
 34. Removing a directory row suppresses unedited descendants in ViewSemanticFrame and evacuates explicitly moved descendants before DELETE_TREE.
@@ -2424,15 +2449,15 @@ Version one is ready when:
 38. Destination creation uses exclusive/no-replace behavior and never overwrites, including races after final preflight.
 39. Only ordinary full-buffer write of the current visible Open FRED buffer through Lua `BufWriteCmd` enters planning; one write processes one Instance and exact private URI.
 40. Buffer-local `FileWriteCmd` and `FileAppendCmd` reject ranged/append writes before ordinary I/O and never capture or plan.
-41. Invalid or conflicted preparation shows non-confirmable diagnostics and preserves dirty edits; a valid plan returns one sealed one-shot PreparedApply; a non-empty plan shows one immutable all-or-nothing preview, while an empty plan skips preview but still passes through final execute-witness checks.
-42. `apply_finish` consumes PreparedApply exactly once; duplicate/replayed/foreign/dropped capabilities are rejected, preview mutation cannot alter the plan, and explicit preview cancellation or handle drop releases plan memory without a process-wide prepared-plan registry.
-43. Every plan carries projection, edit-base, planned-root, intent, and changedtick authority; Lua establishes `ApplyBufferGuard` before Execute; stale authority is validated before an already-requested execution cancellation may abandon intent; late edits abort without overwrite; every clean or abort path releases the guard.
-44. One process-global mutation lock covers every non-empty write-driven Execute and `:FredLink`; before enumerating RootSessions or issuing the first syscall, Apply registers Planner-owned affected paths in a process-wide active mutation fence that existing and newly created RootSessions consult at scan start and publication.
-45. Every post-lock outcome coalesces and schedules queued refresh demand, leaves Apply, releases scan-generation fences, removes the process-wide active mutation affected-path fence, and releases the lock before its terminal outcome becomes observable.
-46. Executor is serial, no-replace, fail-stop, and cooperatively cancellable; no later node runs after the first failure or accepted cancellation, long/compound operations check safe points, blocking syscalls may finish first, cancellation observed only after final-node success is Success, and no automatic retry or rollback occurs.
-47. Same-filesystem MOVE and fully successful cross-filesystem MOVE retain the source NodeId at destination; a PendingCopy-derived MOVE emits an authoritative terminal provisional-to-source NodeIdTransition only after success is known.
+41. Invalid or conflicted preparation shows non-confirmable diagnostics and preserves dirty edits; a valid plan returns one sealed one-shot PreparedApply carrying one ApplyAuthorityStamp; a non-empty plan shows one immutable all-or-nothing preview, while an empty plan skips preview but still passes through final authority/changedtick checks.
+42. `apply_finish` consumes PreparedApply exactly once; duplicate/replayed/foreign/dropped capabilities are rejected, preview mutation cannot alter the plan, and preview cancellation drops the capability and releases plan memory without an explicit native Cancel branch or process-wide prepared-plan registry.
+43. Every plan carries one ApplyAuthorityStamp covering View identity/authority epoch, RootRevision, ProjectionRevision, and changedtick. Rust validates it before an already-requested execution cancellation may abandon intent and again after gate/fence registration; Lua establishes ApplyBufferGuard before Execute and alone validates its local write_epoch. A pre-gate accepted cancellation or empty plan publishes no RootSnapshot, late edits abort without overwrite, and every clean or abort path releases the guard.
+44. One process-level MutationCoordinator and global mutation lock cover every non-empty write-driven Execute and `:FredLink`; before enumerating RootSessions or issuing the first syscall, the coordinator registers Planner-owned affected paths in an active mutation fence that existing and newly created RootSessions consult at scan start and publication.
+45. Every post-lock outcome coalesces and schedules queued refresh demand, releases scan-generation fences, removes the active mutation fence, sets MutationCoordinator to Idle, and releases the lock before its terminal outcome becomes observable.
+46. Planner may use a transient dependency graph but seals one linear execution program. Executor is serial, no-replace, fail-stop, and cooperatively cancellable; no later node runs after the first failure or accepted cancellation, long/compound operations check safe points, blocking syscalls may finish first, cancellation observed only after final-node success is Success, and no automatic retry or rollback occurs.
+47. Same-filesystem MOVE and fully successful cross-filesystem MOVE retain the source NodeId at destination; a PendingCopy-derived MOVE emits an authoritative terminal provisional-to-source NodeIdTransition only after success is known, and the transition is sealed with the clean frame inside one TerminalProjection.
 48. Cross-filesystem copy success followed by source-delete failure, or cancellation observed after copy success and before deletion starts or before a cancellable deletion completes, retains the source NodeId and a distinct destination NodeId, reusing the PendingCopy provisional destination when available and allocating one otherwise; successful deletion followed only by later cancellation observation remains Success; failed or cancelled partial COPY_TREE discoveries use new NodeIds for unrepresented destination nodes.
-49. Execution failure reports COMPLETED/FAILED/UNSTARTED; accepted execution cancellation reports COMPLETED/CANCELLED/UNSTARTED. Both publish known successful effects, resolve terminal identity from those effects, abandon failed/cancelled and unstarted initiating intent, synchronously consume the clean initiating frame and any authoritative NodeIdTransition values, clear `'modified'` before `BufWriteCmd` returns write failure, then defer only best-effort refresh/ancillary UI, so real Neovim 0.12.4 `:wq` remains open with a clean buffer.
+49. Execution failure reports COMPLETED/FAILED/UNSTARTED; accepted execution cancellation reports COMPLETED/CANCELLED/UNSTARTED. Post-gate outcomes publish known successful effects, resolve terminal identity, mark scopes with potentially unreported effects Partial/RetainedUnverified, and abandon failed/cancelled and unstarted initiating intent. Apply seals the clean frame, transitions, outcome, and expected changedtick in one TerminalProjection; BufferRuntime consumes it through one non-reentrant one-shot critical section and clears `'modified'` before `BufWriteCmd` returns write failure, then defers only best-effort refresh/ancillary UI, so real Neovim 0.12.4 `:wq` remains open with a clean buffer.
 50. `:FredLink` resolves relative paths against the buffer directory, creates exclusively, uses the shared mutation runner/global lock/process-wide active affected-path fence/common finalizer, treats directory symlinks as leaves in existing sessions, refreshes overlapping sessions when needed, and always removes the fence and releases the lock.
 51. One Instance owns at most one buffer/View while one buffer may appear in multiple windows/tabpages; layouts remain native Lua concerns.
 52. Created/Open/Hidden/Destroyed lifecycle, display reconciliation, borrowed/owned layout behavior, cleanup timers, group LRUs, capacity zero, delay zero, and one idempotent terminal destroy path pass.
@@ -2458,8 +2483,8 @@ Version one is ready when:
 - Retained immutable snapshots increase memory use while dirty Views or active tasks hold strong references; version one relies on ordinary ownership release rather than a separate memory-budget eviction policy.
 - A long-lived RootSession may cumulatively retain namespace and metadata cache for scopes visited by earlier generations even after current View coverage moves elsewhere. Per-generation scan limits do not bound that total; all retained cache is guaranteed to release only when the final View/task references release the whole RootSession.
 - Metadata columns and metadata-backed Lua sorting add stat calls and platform-specific normalization cost, especially for large covered roots.
-- Lua mirrors each View's bounded ViewSemanticFrame catalog, child membership, ProjectedRows, bindings, and classification cache, increasing main-thread work, memory use, and garbage-collection pressure at large coverage limits.
-- A slow or failing `is_hidden_file` callback, common projector, FlatProjectionCodec, or ProjectionCommit can delay or abort presentation; errors are intentionally fail-fast and version one adds no renderer rollback or recovery state.
+- Lua mirrors each View's bounded ViewSemanticFrame catalog, child membership, ordered projected NodeIds, bindings, and classification cache, increasing main-thread work, memory use, and garbage-collection pressure at large coverage limits. ProjectedRow objects are transient but projection still performs O(n) work.
+- A slow or failing `is_hidden_file` callback, common projector, flat encode/decode, or ProjectionCommit can delay or abort presentation; errors are intentionally fail-fast and version one adds no renderer rollback or recovery state.
 - Actual hidden-file visibility changes intentionally reset Neovim undo history even when visible rows do not change; clean sibling-sort changes reset history only when real-row order changes; unapplied semantic intent survives either reset, but earlier text undo steps do not.
 - A failed or unavailable stat may leave a placeholder until the next metadata refresh; it must never be interpreted as a missing namespace entry.
 - Extmark and provenance behavior under complex edits requires headless and property testing.
@@ -2469,7 +2494,7 @@ Version one is ready when:
 - Native jumplist/alternate-buffer behavior depends on normal Neovim window buffer switching and is not supplemented by a Fred history stack.
 - Exact-root and explicit lineage sharing means one RootSession may serve Views rooted at different descendant NodeIds; path rebasing, coverage reference counting, and root-node deletion/move cases require dedicated tests.
 - Directory symlink targets intentionally open as separate RootSessions, so expansion, NodeId, intent, and provenance do not cross that boundary automatically.
-- Version one proves the projection-neutral boundary only with FlatProjectionCodec; a future editable tree codec will still require its own indentation/parent reconstruction, invalid-layout, cut/put, dirty-switch, and undo tests even though Rust types and planner remain unchanged.
+- Version one proves the projection-neutral boundary only with internal flat functions and a test-only tree-shaped projection fixture; a future editable tree projection will still require its own indentation/parent reconstruction, invalid-layout, cut/put, dirty-switch, and undo tests and may justify introducing a real projection interface at that time, even though Rust types and planner remain unchanged.
 - User `on_attach`, keymap, hidden-file, and custom action callbacks execute inside Neovim and may fail or introduce user-side latency.
 
 These risks are explicit constraints. The design favors a small namespace planner, direct platform operations, one global mutation gate, serial fail-stop execution, and best-effort refresh over complex guarantees for rare interruption scenarios.
